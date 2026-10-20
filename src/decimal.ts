@@ -1,4 +1,4 @@
-import type { SqlValue } from "./database";
+import type { SqlValue } from "./database.ts";
 
 // Counter arithmetic. Integers add as numbers. Decimals stored as text, such as
 // "2.500", add exactly and keep the larger number of places.

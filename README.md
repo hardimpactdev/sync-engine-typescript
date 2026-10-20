@@ -26,21 +26,19 @@ The wire contract is [`docs/protocol-v1.md`](docs/protocol-v1.md). The JSON
 fixtures in [`fixtures/v1/`](fixtures/v1) pin it. Both are owned by
 sync-engine-laravel; CI fails when this copy differs.
 
-> **Status:** pre-release. The package is not on npm yet.
+> **Status:** 0.x. The API may change between minor versions.
 
 ## Requirements
 
-- A TypeScript-aware bundler (Metro, Vite, esbuild). The package ships
-  TypeScript source.
+- An ES module environment: Node 22+, a modern browser, or a bundler such as
+  Metro or Vite. The package ships compiled JavaScript with type definitions.
 - React 18+ only if you use `@hardimpactdev/sync-engine/react`.
 - A server running [sync-engine-laravel](https://github.com/hardimpactdev/sync-engine-laravel).
 
 ## Install
 
-Until the package is published, install it from GitHub:
-
 ```sh
-npm install @hardimpactdev/sync-engine@github:hardimpactdev/sync-engine-typescript
+npm install @hardimpactdev/sync-engine
 ```
 
 ## Set up the store
@@ -159,6 +157,10 @@ function Projects() {
 | ---------- | ------------------- |
 | Tests      | `npm test`          |
 | Typecheck  | `npm run typecheck` |
+| Build      | `npm run build`     |
+
+To release, publish a GitHub release with the tag `vX.Y.Z`. The Publish workflow
+sets that version and publishes it to npm with provenance.
 
 ## License
 

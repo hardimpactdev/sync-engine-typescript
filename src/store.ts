@@ -1,6 +1,6 @@
-import type { Row, SqlDatabase, SqlValue } from "./database";
-import { addValues, negate } from "./decimal";
-import type { CounterSpec, EntitySpec } from "./spec";
+import type { Row, SqlDatabase, SqlValue } from "./database.ts";
+import { addValues, negate } from "./decimal.ts";
+import type { CounterSpec, EntitySpec } from "./spec.ts";
 
 // Every write to synced data goes through the store. In one transaction it
 // changes the row and writes or merges its outbox entry (protocol §6). After

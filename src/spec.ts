@@ -1,4 +1,4 @@
-import type { Row, SqlDatabase } from "./database";
+import type { Row, SqlDatabase } from "./database.ts";
 
 // What an app tells the store about each synced entity. The store enforces it
 // on every write, and the sync functions use it to rebase and remap.

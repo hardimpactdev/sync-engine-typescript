@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useMemo, useSyncExternalStore } from "react";
-import type { EngineTable, LocalStore } from "./store";
+import type { EngineTable, LocalStore } from "./store.ts";
 
 // React bindings, in their own entry so the store itself needs no React.
 

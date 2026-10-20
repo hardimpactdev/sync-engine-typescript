@@ -1,6 +1,6 @@
-import type { Row } from "./database";
-import type { Ack, PullPage, WireChange } from "./protocol";
-import { engineOf, type Engine, type LocalStore, type OutboxEntry } from "./store";
+import type { Row } from "./database.ts";
+import type { Ack, PullPage, WireChange } from "./protocol.ts";
+import { engineOf, type Engine, type LocalStore, type OutboxEntry } from "./store.ts";
 
 // The device's half of a sync run, as functions over the store and a parsed
 // response. The HTTP client calls them in this order: takeBatch, post the

@@ -1,7 +1,6 @@
 {
     "name": "@hardimpactdev/sync-engine",
-    "version": "0.0.0",
-    "private": true,
+    "version": "0.1.0",
     "description": "TypeScript client for Sync Engine: a local-first SQLite store with an outbox, a sync client and a scheduler, with optional React hooks. Pairs with the Laravel server, hardimpactdev/sync-engine.",
     "keywords": [
         "sync",
@@ -19,15 +18,25 @@
     "homepage": "https://github.com/hardimpactdev/sync-engine-typescript#readme",
     "type": "module",
     "exports": {
-        ".": "./src/index.ts",
-        "./react": "./src/react.ts"
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        },
+        "./react": {
+            "types": "./dist/react.d.ts",
+            "import": "./dist/react.js"
+        }
     },
+    "types": "./dist/index.d.ts",
     "files": [
+        "dist",
         "src"
     ],
     "scripts": {
+        "build": "node scripts/build.mjs",
         "test": "tsx --test tests/*.test.ts",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "tsc --noEmit",
+        "prepublishOnly": "npm run typecheck && npm test && npm run build"
     },
     "devDependencies": {
         "@types/node": "^24.19.2",
@@ -42,5 +51,9 @@
         "react": {
             "optional": true
         }
+    },
+    "publishConfig": {
+        "access": "public",
+        "provenance": true
     }
 }

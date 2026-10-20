@@ -6,10 +6,10 @@ export {
     type SyncRequestBody,
     type SyncTransport,
     type SyncTransportResult,
-} from "./client";
-export type { Row, SqlDatabase, SqlValue } from "./database";
-export { addValues, negate } from "./decimal";
-export { migrate, syncEngineSchemaV1, type Migration } from "./migrate";
+} from "./client.ts";
+export type { Row, SqlDatabase, SqlValue } from "./database.ts";
+export { addValues, negate } from "./decimal.ts";
+export { migrate, syncEngineSchemaV1, type Migration } from "./migrate.ts";
 export type {
     Ack,
     PulledChange,
@@ -17,8 +17,8 @@ export type {
     RejectionCode,
     SyncResponse,
     WireChange,
-} from "./protocol";
-export type { CounterSpec, EntitySpec, OperationSpec } from "./spec";
+} from "./protocol.ts";
+export type { CounterSpec, EntitySpec, OperationSpec } from "./spec.ts";
 export {
     createLocalStore,
     MissingRowError,
@@ -28,7 +28,7 @@ export {
     type OutboxEntry,
     type StoreOptions,
     type WriteOptions,
-} from "./store";
+} from "./store.ts";
 export {
     applyAcks,
     applyPullPage,
@@ -40,11 +40,11 @@ export {
     type PullResult,
     type RejectedChange,
     type TakeBatchOptions,
-} from "./sync";
+} from "./sync.ts";
 export {
     createSyncScheduler,
     type SyncScheduler,
     type SyncSchedulerOptions,
     type SyncTrigger,
-} from "./scheduler";
-export { createUlidFactory } from "./ulid";
+} from "./scheduler.ts";
+export { createUlidFactory } from "./ulid.ts";
