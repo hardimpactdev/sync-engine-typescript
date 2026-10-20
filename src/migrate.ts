@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "./database";
+import type { SqlDatabase } from "./database.ts";
 
 /** A SQL script, or a function for a step that needs code, such as moving data. */
 export type Migration = string | ((db: SqlDatabase) => void);

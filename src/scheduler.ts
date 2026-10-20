@@ -1,4 +1,4 @@
-import type { SyncClient, SyncOutcome } from "./client";
+import type { SyncClient, SyncOutcome } from "./client.ts";
 
 // When to sync: soon after a local write, at once on any other
 // trigger, and again after a failure with growing waits. Outcomes that need the

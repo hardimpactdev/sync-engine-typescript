@@ -1,6 +1,6 @@
-import type { Row } from "./database";
-import type { Ack, PullPage, WireChange } from "./protocol";
-import { engineOf, type LocalStore } from "./store";
+import type { Row } from "./database.ts";
+import type { Ack, PullPage, WireChange } from "./protocol.ts";
+import { engineOf, type LocalStore } from "./store.ts";
 import {
     applyAcks,
     applyPullPage,
@@ -9,7 +9,7 @@ import {
     takeBatch,
     type RejectedChange,
     type TakeBatchOptions,
-} from "./sync";
+} from "./sync.ts";
 
 // One sync run for one scope (protocol §3): push the next batch of the
 // outbox, apply the acks, then pull pages until the feed is drained. The app

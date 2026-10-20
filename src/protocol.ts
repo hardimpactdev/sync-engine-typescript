@@ -1,4 +1,4 @@
-import type { Row } from "./database";
+import type { Row } from "./database.ts";
 
 // The wire format of docs/protocol-v1.md, as the device sends and reads it.
 
