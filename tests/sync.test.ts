@@ -272,6 +272,22 @@ test("a remap onto a row the phone has merges the two and leaves sent changes as
     assert.deepEqual(outbox(store)[0].payload, { name: "Lamp", room_id: attic });
 });
 
+test("a remap of the scope itself still acks the rest of its batch", () => {
+    const { store } = setup();
+    // A guest's own scope, as a device makes it before the user signs in.
+    const guest = store.insert("scopes", { name: "Guest" });
+    const attic = store.insert("rooms", { scope_id: guest, name: "Attic" });
+    const [scopeChange, roomChange] = takeBatch(store, guest);
+
+    applyAcks(store, guest, [
+        { change_id: scopeChange.change_id, status: "applied", seq: 7, remap: { from: guest, to: scope } },
+        { change_id: roomChange.change_id, status: "applied", seq: 8 },
+    ]);
+    assert.deepEqual(outbox(store), []);
+    assert.equal(row(store, "rooms", attic)?.scope_id, scope);
+    assert.equal(row(store, "rooms", attic)?.server_seq, 8);
+});
+
 test("a pull keeps pending fields, adds pending deltas and keeps pending deletes hidden", () => {
     const { store } = setup();
     pulled(store, "items", item, { name: "Dishwasher", notes: null }, 1);

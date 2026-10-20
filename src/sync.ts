@@ -102,10 +102,11 @@ export function applyAcks(store: LocalStore, scopeId: string, acks: Ack[]): AckR
     const result: AckResult = { applied: [], rejected: [], remapped: [] };
     engine.transaction(() => {
         for (const ack of acks) {
-            const entry = engine.db.get<OutboxEntry>(
-                "SELECT * FROM sync_outbox WHERE change_id = ? AND scope_id = ?",
-                [ack.change_id, scopeId],
-            );
+            // By change id alone: an earlier ack in this batch may have remapped the
+            // scope itself, which moves the batch's other entries to the new scope.
+            const entry = engine.db.get<OutboxEntry>("SELECT * FROM sync_outbox WHERE change_id = ?", [
+                ack.change_id,
+            ]);
             if (!entry) continue;
             if (ack.status === "rejected") {
                 result.rejected.push(...reject(engine, entry, ack));
