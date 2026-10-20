@@ -1,10 +1,5 @@
-# Kept out of the Composer dist and GitHub archives. js/src and package.json stay,
-# because npm installs from the same archive.
+# Kept out of GitHub archives, which npm installs from. src and package.json stay.
 /.github export-ignore
 /.editorconfig export-ignore
 /.gitattributes export-ignore
-/js/tests export-ignore
 /tests export-ignore
-/phpstan.neon export-ignore
-/phpunit.xml export-ignore
-/pint.json export-ignore
