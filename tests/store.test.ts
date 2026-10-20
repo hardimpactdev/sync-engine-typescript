@@ -147,7 +147,7 @@ test("a delete of a row the server knows leaves the changes in it alone", () => 
     assert.equal(store.all("SELECT * FROM items").length, 1);
 });
 
-test("a cancelled insert takes only the reference out of a later upsert", () => {
+test("a cancelled insert leaves a later upsert of a row that stays, for the server to reject", () => {
     const { store } = setup();
     pulled(store, "items", "SOFA", { name: "Sofa" }, 20);
     const lamp = store.insert("items", { scope_id: scope, name: "Lamp" });
@@ -159,7 +159,8 @@ test("a cancelled insert takes only the reference out of a later upsert", () => 
         outbox(store).map((entry) => [entry.row_id, entry.payload]),
         [
             [lamp, { name: "Lamp" }],
-            ["SOFA", { notes: "Torn" }],
+            ["SOFA", { room_id: attic, notes: "Torn" }],
+            [lamp, { room_id: attic }],
         ],
     );
     assert.equal(store.all("SELECT * FROM items").length, 2);

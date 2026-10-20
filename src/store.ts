@@ -527,8 +527,10 @@ function createEngine<T extends string>(
     /**
      * Removes a row the server never saw, with its queued changes. Unsent
      * changes that point at the row go too, or the server would reject them.
-     * A change that made its own row cancels that row in turn. A later upsert
-     * loses only the reference; an operation is dropped.
+     * A change that made its own row cancels that row in turn, and an
+     * operation is dropped. A later upsert of a row that stays is kept: the
+     * server rejects it with the row's current values, and the device
+     * restores the row from them.
      */
     function cancel(entity: string, rowId: string) {
         drop(entriesFor(entity, rowId));
@@ -548,21 +550,7 @@ function createEngine<T extends string>(
                 cancel(entry.entity, entry.row_id);
                 continue;
             }
-            const payload = JSON.parse(entry.payload) as Row;
-            if (entry.op === "upsert") {
-                for (const [field, target] of spec(entry.entity).references) {
-                    if (target === entity && payload[field] === rowId) delete payload[field];
-                }
-            }
-            if (entry.op !== "upsert" || Object.keys(payload).length === 0) {
-                drop([entry]);
-                continue;
-            }
-            db.run("UPDATE sync_outbox SET payload = ? WHERE position = ?", [
-                JSON.stringify(payload),
-                entry.position,
-            ]);
-            touch("sync_outbox");
+            if (entry.op !== "upsert") drop([entry]);
         }
     }
 
