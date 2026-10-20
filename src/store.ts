@@ -174,8 +174,7 @@ export function createLocalStore<T extends string>(
                 const entries = engine.entriesFor(table, syncId);
                 if (!engine.knownToServer(row, entries)) {
                     // An unsent insert and its delete cancel out.
-                    engine.drop(entries);
-                    engine.deleteRow(table, syncId);
+                    engine.cancel(table, syncId);
                     return;
                 }
                 engine.drop(entries.filter((entry) => engine.unsent(entry)));
@@ -526,6 +525,36 @@ function createEngine<T extends string>(
     }
 
     /**
+     * Removes a row the server never saw, with its queued changes. Unsent
+     * changes that point at the row go too, or the server would reject them.
+     * A change that made its own row cancels that row in turn, and an
+     * operation is dropped. A later upsert of a row that stays is kept: the
+     * server rejects it with the row's current values, and the device
+     * restores the row from them.
+     */
+    function cancel(entity: string, rowId: string) {
+        drop(entriesFor(entity, rowId));
+        deleteRow(entity, rowId);
+        const key = `${entity}:${rowId}`;
+        const mentions = db.all<OutboxEntry>(
+            "SELECT * FROM sync_outbox WHERE state = 'pending' AND attempts = 0 AND instr(payload, ?) > 0 ORDER BY position",
+            [rowId],
+        );
+        for (const entry of mentions) {
+            if (!referencesOf(entry).includes(key)) continue;
+            // A cancel earlier in this loop may have removed it already.
+            if (!db.get("SELECT 1 FROM sync_outbox WHERE position = ?", [entry.position])) continue;
+            const child = row(entry.entity, entry.row_id);
+            const entries = entriesFor(entry.entity, entry.row_id);
+            if (child && !knownToServer(child, entries) && entries[0].position === entry.position) {
+                cancel(entry.entity, entry.row_id);
+                continue;
+            }
+            if (entry.op !== "upsert") drop([entry]);
+        }
+    }
+
+    /**
      * Writes a server version of a row with the queued changes on top: fields of
      * queued upserts keep their queued values, counters get their queued deltas,
      * and a queued delete keeps the row hidden.
@@ -705,6 +734,7 @@ function createEngine<T extends string>(
         referencesOf,
         shiftCounters,
         drop,
+        cancel,
         rebaseRow,
         remap,
     };
