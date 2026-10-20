@@ -6,8 +6,11 @@ import {
     type SyncTransport,
     type SyncTransportResult,
 } from "../src/client.ts";
+import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
 import { createSyncScheduler } from "../src/scheduler.ts";
+import { createLocalStore } from "../src/store.ts";
 import { cursorOf } from "../src/sync.ts";
+import { memoryDatabase } from "./memory-database.ts";
 import { scope, outbox, pulled, setup, type Store } from "./setup.ts";
 
 const client = "01JBC4Y0R8T5D8M4QKX3N2V6ZA";
@@ -128,6 +131,44 @@ test("a scope the user lost is purged, and the lost changes are counted", async 
     assert.deepEqual(names(store), []);
     assert.deepEqual(outbox(store), []);
     assert.equal(cursorOf(store, scope), null);
+});
+
+test("a purge also takes child rows that find their scope through a parent", async () => {
+    const db = memoryDatabase();
+    const columns = `sync_id TEXT PRIMARY KEY NOT NULL, server_id INTEGER UNIQUE, server_seq INTEGER,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT`;
+    migrate(db, [
+        syncEngineSchemaV1,
+        `CREATE TABLE lists (${columns}, scope_id TEXT NOT NULL, name TEXT NOT NULL);
+         CREATE TABLE entries (${columns}, list_id TEXT NOT NULL, name TEXT NOT NULL);`,
+    ]);
+    let id = 0;
+    const store = createLocalStore(db, {
+        tables: ["lists", "entries"],
+        entities: {
+            entries: {
+                references: { list_id: "lists" },
+                scope: (row, reader) =>
+                    reader.get<{ scope_id: string }>("SELECT scope_id FROM lists WHERE sync_id = ?", [row.list_id])
+                        ?.scope_id ?? null,
+            },
+        },
+        newId: () => `ID${String(++id).padStart(4, "0")}`,
+    });
+    const list = store.insert("lists", { scope_id: scope, name: "Groceries" });
+    store.insert("entries", { list_id: list, name: "Milk" });
+
+    const outcome = await createSyncClient({
+        store,
+        scopeId: scope,
+        clientId: client,
+        entities: ["lists", "entries"],
+        transport: scripted({ status: 404, body: {} }).transport,
+    }).sync();
+
+    assert.deepEqual(outcome, { status: "gone", lostChanges: 2 });
+    assert.equal(store.all("SELECT * FROM entries").length, 0);
+    assert.equal(store.all("SELECT * FROM lists").length, 0);
 });
 
 test("a resync pulls from the start and sweeps rows the server no longer has", async () => {
