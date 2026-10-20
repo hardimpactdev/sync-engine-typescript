@@ -5,7 +5,7 @@ import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
 import { createLocalStore, MissingRowError } from "../src/store.ts";
 import { applyPullPage, returnToPending, takeBatch } from "../src/sync.ts";
 import { memoryDatabase } from "./memory-database.ts";
-import { scope, outbox, pulled, setup, type Store } from "./setup.ts";
+import { scope, outbox, pulled, setup, tables, testMigrations, type Store } from "./setup.ts";
 
 function room(store: Store, name = "Kitchen") {
     return store.insert("rooms", { scope_id: scope, name });
@@ -83,6 +83,123 @@ test("an unsent insert and its delete cancel out", () => {
     store.update("items", item, { notes: "Old" });
     store.remove("items", item);
     assert.deepEqual(outbox(store), []);
+    assert.equal(store.all("SELECT * FROM items").length, 0);
+});
+
+test("a cancelled insert takes the new rows in it along", () => {
+    const { store } = setup();
+    const attic = room(store, "Attic");
+    store.insert("items", { scope_id: scope, name: "Lamp", room_id: attic });
+    store.remove("rooms", attic);
+    assert.deepEqual(outbox(store), []);
+    assert.equal(store.all("SELECT * FROM items").length, 0);
+});
+
+test("a cancelled insert takes the operations that point at it along", () => {
+    const { store } = setup();
+    const rice = store.insert("stock", { scope_id: scope, name: "Rice" });
+    const movement = store.newId();
+    store.operate("movements", movement, "record", { stock_id: rice, delta: "1.500" }, (local) =>
+        local.put("movements", movement, { scope_id: scope, stock_id: rice, delta: "1.500" }),
+    );
+    store.remove("stock", rice);
+    assert.deepEqual(outbox(store), []);
+    assert.equal(store.all("SELECT * FROM movements").length, 0);
+});
+
+test("a cancelled insert keeps a change the server may have seen", () => {
+    const { store, db } = setup();
+    const attic = room(store, "Attic");
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp", room_id: attic });
+    db.run("UPDATE sync_outbox SET state = 'sending', attempts = 1 WHERE entity = 'items'");
+    store.insert("items", { scope_id: scope, name: "Chair", room_id: attic });
+    store.remove("rooms", attic);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.row_id, entry.state]),
+        [[lamp, "sending"]],
+    );
+    assert.deepEqual(
+        store.all<{ sync_id: string }>("SELECT sync_id FROM items").map((item) => item.sync_id),
+        [lamp],
+    );
+});
+
+test("a delete of a row the server knows leaves the changes in it alone", () => {
+    const { store } = setup();
+    pulled(store, "rooms", "ATTIC", { name: "Attic" }, 12);
+    pulled(store, "stock", "RICE", { name: "Rice", quantity: "2.000" }, 13);
+    store.insert("items", { scope_id: scope, name: "Lamp", room_id: "ATTIC" });
+    const movement = store.newId();
+    store.operate("movements", movement, "record", { stock_id: "RICE", delta: "1.500" }, (local) =>
+        local.put("movements", movement, { scope_id: scope, stock_id: "RICE", delta: "1.500" }),
+    );
+    store.remove("rooms", "ATTIC");
+    store.remove("stock", "RICE");
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.op]),
+        [
+            ["items", "upsert"],
+            ["movements", "record"],
+            ["rooms", "delete"],
+            ["stock", "delete"],
+        ],
+    );
+    assert.equal(store.all("SELECT * FROM items").length, 1);
+});
+
+test("a cancelled insert takes only the reference out of a later upsert", () => {
+    const { store } = setup();
+    pulled(store, "items", "SOFA", { name: "Sofa" }, 20);
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp" });
+    const attic = room(store, "Attic");
+    store.update("items", "SOFA", { room_id: attic, notes: "Torn" });
+    store.update("items", lamp, { room_id: attic });
+    store.remove("rooms", attic);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.row_id, entry.payload]),
+        [
+            [lamp, { name: "Lamp" }],
+            ["SOFA", { notes: "Torn" }],
+        ],
+    );
+    assert.equal(store.all("SELECT * FROM items").length, 2);
+});
+
+test("a cancel follows a chain of new rows and takes back deltas on rows that stay", () => {
+    const db = memoryDatabase();
+    migrate(db, testMigrations);
+    let id = 0;
+    const store = createLocalStore(db, {
+        tables,
+        entities: {
+            items: { references: { room_id: "rooms" } },
+            counters: {
+                operations: {
+                    adjust: {
+                        counters: [{ field: "quantity", delta: "delta" }],
+                        references: { item_id: "items" },
+                    },
+                },
+            },
+        },
+        newId: () => `ID${String(++id).padStart(4, "0")}`,
+    });
+    const quantity = () =>
+        store.get<{ quantity: number }>("SELECT quantity FROM counters WHERE sync_id = 'BULBS'")
+            ?.quantity;
+    pulled(store, "counters", "BULBS", { name: "Bulbs", quantity: 2 }, 7);
+    const attic = room(store, "Attic");
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp", room_id: attic });
+    store.operate("counters", "BULBS", "adjust", { item_id: lamp, delta: 3 });
+    store.operate("counters", "BULBS", "adjust", { delta: 1 });
+    assert.equal(quantity(), 6);
+
+    store.remove("rooms", attic);
+    assert.equal(quantity(), 3);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.op, entry.payload]),
+        [["adjust", { delta: 1 }]],
+    );
     assert.equal(store.all("SELECT * FROM items").length, 0);
 });
 
