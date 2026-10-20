@@ -1,8 +1,8 @@
 {
-    "name": "@hardimpactdev/laravel-sync-engine",
+    "name": "@hardimpactdev/sync-engine",
     "version": "0.0.0",
     "private": true,
-    "description": "Local-first sync client for the Laravel sync engine: a SQLite store with an outbox, a sync client and a scheduler, with optional React hooks.",
+    "description": "TypeScript client for Sync Engine: a local-first SQLite store with an outbox, a sync client and a scheduler, with optional React hooks. Pairs with the Laravel server, hardimpactdev/sync-engine.",
     "keywords": [
         "sync",
         "local-first",
@@ -14,20 +14,19 @@
     "license": "MIT",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/hardimpactdev/laravel-sync-engine.git"
+        "url": "git+https://github.com/hardimpactdev/sync-engine-typescript.git"
     },
-    "homepage": "https://github.com/hardimpactdev/laravel-sync-engine#readme",
+    "homepage": "https://github.com/hardimpactdev/sync-engine-typescript#readme",
     "type": "module",
     "exports": {
-        ".": "./js/src/index.ts",
-        "./react": "./js/src/react.ts"
+        ".": "./src/index.ts",
+        "./react": "./src/react.ts"
     },
     "files": [
-        "js/src",
-        "fixtures"
+        "src"
     ],
     "scripts": {
-        "test": "tsx --test js/tests/*.test.ts",
+        "test": "tsx --test tests/*.test.ts",
         "typecheck": "tsc --noEmit"
     },
     "devDependencies": {

@@ -1,7 +1,10 @@
 # Sync protocol v1
 
-This is the contract between the client (`js/`) and the server (`src/`). Both
-sides follow it.
+This is the contract between the Laravel server
+([sync-engine-laravel](https://github.com/hardimpactdev/sync-engine-laravel))
+and the TypeScript client
+([sync-engine-typescript](https://github.com/hardimpactdev/sync-engine-typescript)).
+Both sides follow it.
 
 A breaking change needs a new `protocol` number. Adding an optional field is
 not breaking.
@@ -220,3 +223,7 @@ Counters add up through their named operation.
 
 `fixtures/v1/*.json` pin the wire format. The PHP tests and the TypeScript tests
 both read them. Change a fixture only together with this document.
+
+Both repositories hold the same copy of this document and the fixtures.
+sync-engine-laravel owns them: change them there first, then copy them to
+sync-engine-typescript, whose CI fails while its copy differs.

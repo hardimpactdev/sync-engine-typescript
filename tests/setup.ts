@@ -105,7 +105,7 @@ export function outbox(store: Store): Entry[] {
 }
 
 export function fixture<T>(name: string): T {
-    return JSON.parse(readFileSync(new URL(`../../fixtures/v1/${name}`, import.meta.url), "utf8")) as T;
+    return JSON.parse(readFileSync(new URL(`../fixtures/v1/${name}`, import.meta.url), "utf8")) as T;
 }
 
 /** Writes a row as a pull brings it. */

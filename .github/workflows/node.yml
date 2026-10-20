@@ -17,3 +17,17 @@ jobs:
             - run: npm ci
             - run: npm run typecheck
             - run: npm test
+
+    # sync-engine-laravel owns the protocol. This copy must match its main branch.
+    protocol:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v5
+            - uses: actions/checkout@v5
+              with:
+                  repository: hardimpactdev/sync-engine-laravel
+                  path: laravel
+                  sparse-checkout: |
+                      docs/protocol-v1.md
+                      fixtures
+            - run: diff -r laravel/fixtures fixtures && diff laravel/docs/protocol-v1.md docs/protocol-v1.md

@@ -12,5 +12,5 @@
         "verbatimModuleSyntax": true,
         "types": ["node", "react"]
     },
-    "include": ["js/**/*.ts"]
+    "include": ["src/**/*.ts", "tests/**/*.ts"]
 }
