@@ -235,8 +235,11 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
                     "SELECT COUNT(*) AS count FROM sync_outbox WHERE scope_id = ?",
                     [scopeId],
                 )?.count ?? 0;
-            for (const table of engine.specs.keys()) {
-                for (const row of rowsOfScope(table)) engine.deleteRow(table, row.sync_id as string);
+            // Find every row first: a child row finds its scope through its parent,
+            // so deleting the parent first would leave the child behind.
+            const rows = [...engine.specs.keys()].map((table) => [table, rowsOfScope(table)] as const);
+            for (const [table, list] of rows) {
+                for (const row of list) engine.deleteRow(table, row.sync_id as string);
             }
             engine.db.run("DELETE FROM sync_outbox WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM sync_rejected WHERE scope_id = ?", [scopeId]);
