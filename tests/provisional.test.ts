@@ -655,4 +655,14 @@ test("a provisional delta lands only on a counter, which no write can overwrite"
         /not a counter/,
     );
     assert.throws(() => store.update("stock", flour, { quantity: "7.000" }), /is a counter/);
+    // Not through an operation's local effect either.
+    pulled(store, "counters", "01JBC59ZQ0B2D4F6H8K0M2P4S6", { name: "Bakes", quantity: 0 }, 9);
+    assert.throws(
+        () =>
+            store.operate("counters", "01JBC59ZQ0B2D4F6H8K0M2P4S6", "adjust", { delta: 1 }, (local) =>
+                local.put("stock", flour, { quantity: "7.000" }),
+            ),
+        /is a counter/,
+    );
+    assert.equal(quantity(store), "5.000");
 });

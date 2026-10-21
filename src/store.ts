@@ -1110,6 +1110,12 @@ function createEngine<T extends string>(
             }
             const stamp = now();
             if (row(table, syncId)) {
+                // A counter of an existing row changes only by deltas, so provisional ones can be taken back.
+                for (const column of Object.keys(values)) {
+                    if (entity.counterFields.has(column)) {
+                        throw new Error(`${table}.${column} is a counter. Change it through an operation.`);
+                    }
+                }
                 const names = Object.keys(values);
                 db.run(
                     `UPDATE ${table} SET ${[...names, "updated_at"].map((name) => `${name} = ?`).join(", ")} WHERE sync_id = ?`,
