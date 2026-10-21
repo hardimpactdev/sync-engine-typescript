@@ -118,7 +118,7 @@ export function applyAcks(store: LocalStore, scopeId: string, acks: Ack[]): AckR
             engine.ackProvisional(entry.change_id);
             const row = engine.row(entry.entity, entry.row_id);
             if (entry.op === "delete") {
-                if (row && row.deleted_at !== null) engine.deleteRow(entry.entity, entry.row_id);
+                if (row && row.deleted_at !== null) engine.deleteWithProvisional(entry.entity, entry.row_id);
             } else if (row) {
                 // The server knows the row now, so a later delete must reach it.
                 engine.db.run(
@@ -161,7 +161,7 @@ function reject(engine: Engine, entry: OutboxEntry, ack: Ack): RejectedChange[] 
             keep(engine, later, "parent_rejected", "An earlier change to this row was rejected.", undefined, null),
         );
     }
-    engine.deleteRow(entry.entity, entry.row_id);
+    engine.deleteWithProvisional(entry.entity, entry.row_id);
     return rejected;
 }
 
@@ -233,7 +233,7 @@ export function applyPullPage(store: LocalStore, scopeId: string, page: PullPage
                 if (pending.some((entry) => entry.op !== "delete")) {
                     result.deletedElsewhere.push({ entity: change.entity, id: change.id });
                 }
-                if (row) engine.deleteRow(change.entity, change.id);
+                if (row) engine.deleteWithProvisional(change.entity, change.id);
                 continue;
             }
             // An older version than the one this device has is skipped.
