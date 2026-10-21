@@ -222,6 +222,7 @@ export function createLocalStore<T extends string>(
                     [...Object.values(patch), now(), syncId],
                 );
                 if (changes === 0) throw new MissingRowError(table, syncId);
+                engine.guardScope(entity.scope(engine.row(table, syncId)!, db));
                 if (Object.keys(synced).length > 0) {
                     const entry = merge
                         ? engine.append(entity, engine.row(table, syncId)!, "upsert", synced, dependsOn, true)
@@ -737,8 +738,7 @@ function createEngine<T extends string>(
             const current = row(effect.entity, effect.row_id);
             if (!current) continue;
             if (effect.field === null) {
-                deleteRow(effect.entity, effect.row_id);
-                releaseProvisionalChildren(effect.entity, effect.row_id);
+                deleteWithProvisional(effect.entity, effect.row_id);
                 continue;
             }
             db.run(`UPDATE ${effect.entity} SET ${effect.field} = ? WHERE sync_id = ?`, [
@@ -793,9 +793,10 @@ function createEngine<T extends string>(
      */
     function cancel(entity: string, rowId: string) {
         drop(entriesFor(entity, rowId));
+        const dependents = provisionalDependents(entity, rowId);
         deleteRow(entity, rowId);
         clearLinks(entity, rowId);
-        releaseProvisionalChildren(entity, rowId);
+        releaseProvisional(entity, rowId, dependents);
         const key = `${entity}:${rowId}`;
         const mentions = db.all<OutboxEntry>(
             "SELECT * FROM sync_outbox WHERE state = 'pending' AND attempts = 0 AND instr(payload, ?) > 0 ORDER BY position",
@@ -824,34 +825,57 @@ function createEngine<T extends string>(
      * a provisional row whose change settled. As a foreign key would, an optional link is
      * cleared and a required link takes the provisional row along; a row in a scope that
      * goes, goes too. Deltas on the row that went have nothing left to land on.
+     *
+     * The dependents are found before the row goes, since an entity's scope resolver may
+     * read that row.
      */
-    function releaseProvisionalChildren(entity: string, rowId: string) {
-        if (!hasProvisional()) return;
-        db.run("DELETE FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NOT NULL", [
-            entity,
-            rowId,
-        ]);
+    type Dependent = { effect: ProvisionalEffect; clear: string[]; goes: boolean };
+
+    function provisionalDependents(entity: string, rowId: string): Dependent[] {
+        if (!hasProvisional()) return [];
+        const dependents: Dependent[] = [];
         for (const effect of db.all<ProvisionalEffect>(
             "SELECT * FROM sync_provisional WHERE field IS NULL ORDER BY id",
         )) {
             const source = specs.get(effect.entity);
             const child = row(effect.entity, effect.row_id);
-            if (!source || !child) continue;
-            let goes = source.scope(child, db) === rowId;
+            if (!source || !child || (effect.entity === entity && effect.row_id === rowId)) continue;
+            const dependent: Dependent = { effect, clear: [], goes: source.scope(child, db) === rowId };
             for (const [field, pointsAt] of source.references) {
-                if (goes || pointsAt !== entity || child[field] !== rowId) continue;
-                if (optional(effect.entity, field)) {
-                    db.run(`UPDATE ${effect.entity} SET ${field} = NULL WHERE sync_id = ?`, [effect.row_id]);
-                    touch(effect.entity);
-                } else {
-                    goes = true;
-                }
+                if (dependent.goes || pointsAt !== entity || child[field] !== rowId) continue;
+                if (optional(effect.entity, field)) dependent.clear.push(field);
+                else dependent.goes = true;
             }
-            if (!goes) continue;
-            db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
-            deleteRow(effect.entity, effect.row_id);
-            releaseProvisionalChildren(effect.entity, effect.row_id);
+            if (dependent.goes || dependent.clear.length) dependents.push(dependent);
         }
+        return dependents;
+    }
+
+    function releaseProvisional(entity: string, rowId: string, dependents: Dependent[]) {
+        if (!hasProvisional()) return;
+        db.run("DELETE FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NOT NULL", [
+            entity,
+            rowId,
+        ]);
+        for (const { effect, clear, goes } of dependents) {
+            if (!row(effect.entity, effect.row_id)) continue;
+            if (goes) {
+                db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
+                deleteWithProvisional(effect.entity, effect.row_id);
+                continue;
+            }
+            for (const field of clear) {
+                db.run(`UPDATE ${effect.entity} SET ${field} = NULL WHERE sync_id = ?`, [effect.row_id]);
+            }
+            touch(effect.entity);
+        }
+    }
+
+    /** Deletes a row, and the provisional rows that need it follow. */
+    function deleteWithProvisional(entity: string, rowId: string) {
+        const dependents = provisionalDependents(entity, rowId);
+        deleteRow(entity, rowId);
+        releaseProvisional(entity, rowId, dependents);
     }
 
     /** Whether a reference column may hold null. A field that is no column counts as required. */

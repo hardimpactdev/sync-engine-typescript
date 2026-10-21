@@ -538,3 +538,61 @@ test("a purged scope takes all its provisional results, also rows in other scope
     assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
     assert.equal(provisional(store), 0);
 });
+
+/** A store whose entries find their scope through a lookup of the scope row. */
+function lookupScopes() {
+    const db = memoryDatabase();
+    migrate(db, [
+        ...testMigrations,
+        `CREATE TABLE entries (sync_id TEXT PRIMARY KEY NOT NULL, owner_scope TEXT NOT NULL, name TEXT NOT NULL,
+            server_id INTEGER, server_seq INTEGER, deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    ]);
+    let id = 0;
+    const store = createLocalStore(db, {
+        tables: ["scopes", "items", "entries"],
+        entities: {
+            scopes: { scope: (row) => row.sync_id as string },
+            entries: {
+                scope: (row, reader) =>
+                    reader.get<{ sync_id: string }>("SELECT sync_id FROM scopes WHERE sync_id = ?", [row.owner_scope])
+                        ?.sync_id ?? null,
+            },
+        },
+        newId: () => `ID${String(++id).padStart(4, "0")}`,
+    });
+    db.run("INSERT INTO scopes (sync_id, name, server_seq, created_at, updated_at) VALUES (?, 'Home', 1, 'x', 'x')", [scope]);
+    applyPullPage(store, scope, {
+        changes: [
+            { entity: "items", id: cake, seq: 1, op: "upsert", row: { name: "Cake" } },
+            { entity: "items", id: flour, seq: 2, op: "upsert", row: { name: "Bread" } },
+        ],
+        cursor: "c2",
+        has_more: false,
+    });
+    return store;
+}
+
+test("an update cannot move a row into a provisional scope", () => {
+    const store = lookupScopes();
+    const entry = store.insert("entries", { owner_scope: scope, name: "Jar" });
+    let shelf = "";
+    store.update("items", cake, { notes: "Baked" }, { provisional: (local) => { shelf = local.insert("scopes", { name: "Shelf" }); } });
+
+    assert.throws(() => store.update("entries", entry, { owner_scope: shelf }), ProvisionalRowError);
+    assert.equal(store.get<{ owner_scope: string }>("SELECT owner_scope FROM entries WHERE sync_id = ?", [entry])?.owner_scope, scope);
+});
+
+test("a provisional row follows a provisional scope that its resolver reads", () => {
+    const store = lookupScopes();
+    let shelf = "";
+    let jar = "";
+    store.update("items", cake, { notes: "Baked" }, { provisional: (local) => { shelf = local.insert("scopes", { name: "Shelf" }); } });
+    store.update("items", flour, { notes: "Baked" }, { provisional: (local) => { jar = local.insert("entries", { owner_scope: shelf, name: "Jar" }); } });
+
+    const [bakeCake] = takeBatch(store, scope);
+    applyAcks(store, scope, [{ change_id: bakeCake.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null } }]);
+
+    assert.equal(store.get("SELECT 1 FROM scopes WHERE sync_id = ?", [shelf]), null);
+    assert.equal(store.get("SELECT 1 FROM entries WHERE sync_id = ?", [jar]), null);
+    assert.equal(store.isProvisional("entries", jar), false);
+});
