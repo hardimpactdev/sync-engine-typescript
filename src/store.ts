@@ -51,7 +51,7 @@ export type ProvisionalWriter = {
      * rows may point at it; they follow it when it goes, as through a foreign key.
      */
     insert(table: string, values: Row): string;
-    /** Adds a delta to a number column of a row, such as a counter. */
+    /** Adds a delta to a counter: a field that an operation's counters change, such as stock. */
     add(table: string, syncId: string, field: string, delta: SqlValue): void;
 };
 
@@ -193,12 +193,13 @@ export function createLocalStore<T extends string>(
             const names = ["sync_id", ...Object.keys(values), "created_at", "updated_at"];
             transaction(() => {
                 engine.guardReferences(entity.references, synced);
-                engine.guardScope(entity.scope({ ...values, sync_id: syncId }, db));
                 db.run(
                     `INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`,
                     [syncId, ...Object.values(values), stamp, stamp],
                 );
                 const row = engine.row(table, syncId)!;
+                // After the write, so a resolver that reads the stored row sees it.
+                engine.guardScope(entity.scope(row, db));
                 const entry = engine.append(entity, row, "upsert", { ...synced }, dependsOn, merge);
                 if (provisional) engine.writeProvisional(entry, provisional);
                 touch(table);
@@ -662,8 +663,9 @@ function createEngine<T extends string>(
             },
             add(table, syncId, field, delta) {
                 spec(table);
-                if (!plainName.test(field) || !columns(table).has(field)) {
-                    throw new Error(`${table}.${field} is not a column.`);
+                // Only a counter: no write may set it, so the delta can always be taken back.
+                if (!spec(table).counterFields.has(field)) {
+                    throw new Error(`${table}.${field} is not a counter of an operation.`);
                 }
                 const current = row(table, syncId);
                 if (!current || current.deleted_at !== null) throw new MissingRowError(table, syncId);
@@ -1100,7 +1102,6 @@ function createEngine<T extends string>(
             const entity = spec(table);
             guardRow(table, syncId);
             guardReferences(entity.references, values);
-            guardScope(entity.scope({ ...(row(table, syncId) ?? {}), ...values, sync_id: syncId }, db));
             for (const column of Object.keys(values)) {
                 if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
                 if (conventions.has(column) && column !== scopeColumn) {
@@ -1121,6 +1122,8 @@ function createEngine<T extends string>(
                     [syncId, ...Object.values(values), stamp, stamp],
                 );
             }
+            // After the write, inside the operation's transaction, so a refusal undoes it.
+            guardScope(entity.scope(row(table, syncId)!, db));
             touch(table);
         },
     };

@@ -596,3 +596,63 @@ test("a provisional row follows a provisional scope that its resolver reads", ()
     assert.equal(store.get("SELECT 1 FROM entries WHERE sync_id = ?", [jar]), null);
     assert.equal(store.isProvisional("entries", jar), false);
 });
+
+test("a scope resolver that reads the stored row still guards inserts and local effects", () => {
+    const db = memoryDatabase();
+    migrate(db, [
+        ...testMigrations,
+        `CREATE TABLE entries (sync_id TEXT PRIMARY KEY NOT NULL, owner_scope TEXT NOT NULL, name TEXT NOT NULL,
+            server_id INTEGER, server_seq INTEGER, deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    ]);
+    let id = 0;
+    const store = createLocalStore(db, {
+        tables: ["scopes", "items", "entries", "counters"],
+        entities: {
+            scopes: { scope: (row) => row.sync_id as string },
+            entries: {
+                scope: (row, reader) =>
+                    reader.get<{ sync_id: string }>(
+                        "SELECT scopes.sync_id FROM entries JOIN scopes ON scopes.sync_id = entries.owner_scope WHERE entries.sync_id = ?",
+                        [row.sync_id],
+                    )?.sync_id ?? null,
+            },
+            counters: { operations: { adjust: { counters: [{ field: "quantity", delta: "delta" }] } } },
+        },
+        newId: () => `ID${String(++id).padStart(4, "0")}`,
+    });
+    db.run("INSERT INTO scopes (sync_id, name, server_seq, created_at, updated_at) VALUES (?, 'Home', 1, 'x', 'x')", [scope]);
+    applyPullPage(store, scope, {
+        changes: [
+            { entity: "items", id: cake, seq: 1, op: "upsert", row: { name: "Cake" } },
+            { entity: "counters", id: flour, seq: 2, op: "upsert", row: { name: "Bakes", quantity: 0 } },
+        ],
+        cursor: "c2",
+        has_more: false,
+    });
+    let shelf = "";
+    store.update("items", cake, { notes: "Baked" }, { provisional: (local) => { shelf = local.insert("scopes", { name: "Shelf" }); } });
+    store.operate("counters", flour, "adjust", { delta: 1 }, (local) => local.put("entries", "ID9000", { owner_scope: scope, name: "Jar" }));
+    const queued = () => store.get<{ count: number }>("SELECT COUNT(*) AS count FROM sync_outbox")?.count;
+    const before = queued();
+
+    assert.throws(() => store.insert("entries", { owner_scope: shelf, name: "Tin" }), ProvisionalRowError);
+    assert.throws(
+        () => store.operate("counters", flour, "adjust", { delta: 1 }, (local) => local.put("entries", "ID9000", { owner_scope: shelf })),
+        ProvisionalRowError,
+    );
+    assert.equal(queued(), before);
+    assert.equal(store.get<{ owner_scope: string }>("SELECT owner_scope FROM entries WHERE sync_id = 'ID9000'")?.owner_scope, scope);
+});
+
+test("a provisional delta lands only on a counter, which no write can overwrite", () => {
+    const { store } = kitchen();
+
+    assert.throws(
+        () =>
+            store.update("items", cake, { notes: "Baked" }, {
+                provisional: (local) => local.add("items", cake, "notes", "1"),
+            }),
+        /not a counter/,
+    );
+    assert.throws(() => store.update("stock", flour, { quantity: "7.000" }), /is a counter/);
+});

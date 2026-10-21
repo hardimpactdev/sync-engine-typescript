@@ -122,7 +122,7 @@ store.update("meals", mealId, { status: "consumed" }, {
 });
 ```
 
-`insert`, `update` and `operate` take the option. The provisional writes have no
+`insert`, `update` and `operate` take the option. `add` works on counters only, the fields operations change, since no write may set them. The provisional writes have no
 outbox entry. A pull that brings one of those rows keeps the provisional delta
 on top, as it keeps queued counters. They go when the server has answered the
 change:
