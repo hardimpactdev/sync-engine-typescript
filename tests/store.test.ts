@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSyncClient } from "../src/client.ts";
-import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
+import { migrate, syncEngineSchemaV1, syncEngineSchemaV2 } from "../src/migrate.ts";
 import { createLocalStore, MissingRowError } from "../src/store.ts";
 import { applyPullPage, returnToPending, takeBatch } from "../src/sync.ts";
 import { memoryDatabase } from "./memory-database.ts";
@@ -79,6 +79,71 @@ test("a merge never moves a reference ahead of the row it points at", () => {
             ["items", { room_id: attic, notes: "Broken" }],
         ],
     );
+});
+
+test("a write after an operation on the row never merges ahead of it", () => {
+    const db = memoryDatabase();
+    migrate(db, [
+        syncEngineSchemaV1,
+        `
+        CREATE TABLE rooms (sync_id TEXT PRIMARY KEY NOT NULL, scope_id TEXT NOT NULL, server_seq INTEGER,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, name TEXT NOT NULL);
+        CREATE TABLE sellers (sync_id TEXT PRIMARY KEY NOT NULL, scope_id TEXT NOT NULL, server_seq INTEGER,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, name TEXT NOT NULL);
+        CREATE TABLE items (sync_id TEXT PRIMARY KEY NOT NULL, scope_id TEXT NOT NULL, server_seq INTEGER,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT,
+            name TEXT NOT NULL, room_id TEXT, seller_id TEXT);
+        `,
+        syncEngineSchemaV2,
+    ]);
+    const store = createLocalStore(db, {
+        tables: ["rooms", "sellers", "items"],
+        entities: {
+            items: { references: { room_id: "rooms", seller_id: "sellers" }, operations: { place: {} } },
+        },
+        newId: (() => {
+            let id = 0;
+            return () => `ID${String(++id).padStart(4, "0")}`;
+        })(),
+    });
+    const server = (table: string, id: string, values: Record<string, string>) =>
+        db.run(
+            `INSERT INTO ${table} (sync_id, scope_id, server_seq, created_at, updated_at, ${Object.keys(values).join(", ")}) VALUES (?, ?, 1, 'x', 'x', ${Object.keys(values).map(() => "?").join(", ")})`,
+            [id, scope, ...Object.values(values)],
+        );
+    server("rooms", "KITCHEN", { name: "Kitchen" });
+    server("sellers", "COOLBLUE", { name: "Coolblue" });
+    server("items", "DRILL", { name: "Drill" });
+    const queued = () =>
+        store
+            .all<{ op: string; payload: string }>("SELECT op, payload FROM sync_outbox ORDER BY position")
+            .map((entry) => [entry.op, JSON.parse(entry.payload)]);
+
+    for (const [field, target, typed] of [
+        ["room_id", "KITCHEN", "room_name"],
+        ["seller_id", "COOLBLUE", "seller_name"],
+    ] as const) {
+        db.run("DELETE FROM sync_outbox");
+        // Offline: a rename and a typed name in one save, then a pick of an existing row.
+        store.transaction(() => {
+            store.update("items", "DRILL", { name: `Drill ${field}` });
+            store.operate("items", "DRILL", "place", { [typed]: "Shed" });
+        });
+        store.update("items", "DRILL", { [field]: target });
+
+        assert.deepEqual(
+            queued(),
+            [
+                ["upsert", { name: `Drill ${field}` }],
+                ["place", { [typed]: "Shed" }],
+                ["upsert", { [field]: target }],
+            ],
+            `the pick of ${target} stays after the place`,
+        );
+        // Later writes merge again, after the operation.
+        store.update("items", "DRILL", { name: "Cordless drill" });
+        assert.deepEqual(queued().at(-1), ["upsert", { [field]: target, name: "Cordless drill" }]);
+    }
 });
 
 test("an unsent insert and its delete cancel out", () => {

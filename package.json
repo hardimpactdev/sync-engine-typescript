@@ -1,6 +1,6 @@
 {
     "name": "@hardimpactdev/sync-engine",
-    "version": "0.1.11",
+    "version": "0.1.12",
     "description": "TypeScript client for Sync Engine: a local-first SQLite store with an outbox, a sync client and a scheduler, with optional React hooks. Pairs with the Laravel server, hardimpactdev/sync-engine.",
     "keywords": [
         "sync",
