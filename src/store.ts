@@ -33,6 +33,13 @@ export type WriteOptions = {
      * own result has arrived, then removes them (see the README).
      */
     provisional?: (local: ProvisionalWriter) => void;
+    /**
+     * Sends the upsert as an account merge (protocol §5.4): the server lands it on a
+     * matching row and fills in only what that row lacks. The flag stays with this
+     * change through every resend. Later writes to the row queue as normal changes;
+     * they never merge into it. Needs `syncEngineSchemaV2`.
+     */
+    merge?: boolean;
 };
 
 /** Writes the provisional result of a change. Needs `syncEngineSchemaV2`. */
@@ -96,6 +103,8 @@ export type OutboxEntry = {
     state: "pending" | "sending";
     attempts: number;
     created_at: string;
+    /** 1 for an account merge (syncEngineSchemaV2); absent before it. */
+    merge?: number;
 };
 
 export class MissingRowError extends Error {
@@ -173,7 +182,7 @@ export function createLocalStore<T extends string>(
         newId: options.newId,
         transaction,
 
-        insert(table, values, { dependsOn, provisional } = {}) {
+        insert(table, values, { dependsOn, provisional, merge } = {}) {
             const entity = spec(table);
             const synced = engine.checkWrite(entity, values, "insert");
             const syncId = options.newId();
@@ -187,14 +196,14 @@ export function createLocalStore<T extends string>(
                     [syncId, ...Object.values(values), stamp, stamp],
                 );
                 const row = engine.row(table, syncId)!;
-                const entry = engine.append(entity, row, "upsert", { ...synced }, dependsOn);
+                const entry = engine.append(entity, row, "upsert", { ...synced }, dependsOn, merge);
                 if (provisional) engine.writeProvisional(entry, provisional);
                 touch(table);
             });
             return syncId;
         },
 
-        update(table, syncId, patch, { dependsOn, provisional } = {}) {
+        update(table, syncId, patch, { dependsOn, provisional, merge } = {}) {
             const entity = spec(table);
             const synced = engine.checkWrite(entity, patch, "update");
             const columns = Object.keys(patch);
@@ -211,7 +220,9 @@ export function createLocalStore<T extends string>(
                 );
                 if (changes === 0) throw new MissingRowError(table, syncId);
                 if (Object.keys(synced).length > 0) {
-                    const entry = engine.queueUpsert(entity, engine.row(table, syncId)!, synced, dependsOn);
+                    const entry = merge
+                        ? engine.append(entity, engine.row(table, syncId)!, "upsert", synced, dependsOn, true)
+                        : engine.queueUpsert(entity, engine.row(table, syncId)!, synced, dependsOn);
                     if (provisional) engine.writeProvisional(entry, provisional);
                 }
                 touch(table);
@@ -439,10 +450,14 @@ function createEngine<T extends string>(
         op: string,
         payload: Row,
         dependsOn?: readonly string[],
+        merge = false,
     ): OutboxEntry {
         const changeId = newId();
+        if (merge && !columns("sync_outbox").has("merge")) {
+            throw new Error("A merge change needs syncEngineSchemaV2 in the app's migrations.");
+        }
         db.run(
-            "INSERT INTO sync_outbox (change_id, scope_id, entity, row_id, op, payload, base_seq, depends_on, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            `INSERT INTO sync_outbox (change_id, scope_id, entity, row_id, op, payload, base_seq, depends_on, created_at${merge ? ", merge" : ""}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?${merge ? ", 1" : ""})`,
             [
                 changeId,
                 scopeOf(entity, values),
@@ -475,6 +490,7 @@ function createEngine<T extends string>(
         const mergeable =
             last !== undefined &&
             unsent(last) &&
+            !last.merge &&
             !entries.some((entry) => entry.position > last.position && entry.op === "delete") &&
             !referencesQueuedAfter(entity, fields, last.position);
         if (!mergeable) return append(entity, values, "upsert", fields, dependsOn);

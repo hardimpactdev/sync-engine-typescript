@@ -137,7 +137,17 @@ or a row in it as a scope throws a `ProvisionalRowError`;
 `store.isProvisional(table, id)` tells the app before. Removing a row that was
 never sent takes the provisional rows that need it along.
 This needs `syncEngineSchemaV2`, a later migration step than
-`syncEngineSchemaV1`. It adds the `sync_provisional` table.
+`syncEngineSchemaV1`. It adds the `sync_provisional` table and a `merge` column
+on the outbox.
+
+## Account merge
+
+An app that copies rows into an account's scope, such as a guest's data at
+sign-in, writes the copies with `{ merge: true }`. The change goes as an account
+merge (protocol §5.4): the server lands it on a matching row and fills in only
+what that row lacks. The flag is stored with the change, so every resend is the
+same. Later writes to the row queue as normal changes and never merge into the
+copy. This also needs `syncEngineSchemaV2`.
 
 ## Sync
 

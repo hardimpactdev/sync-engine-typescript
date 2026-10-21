@@ -315,6 +315,7 @@ function toWire(entry: OutboxEntry): WireChange {
         base_seq: entry.base_seq,
         position: entry.position,
         ...(entry.depends_on === null ? {} : { depends_on: files(entry) }),
+        ...(entry.merge ? { merge: true } : {}),
         client_time: entry.created_at,
     };
 }
