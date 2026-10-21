@@ -221,6 +221,7 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
                     const id = row.sync_id as string;
                     if (seen.has(`${table}:${id}`)) continue;
                     if (engine.entriesFor(table, id).length) continue;
+                    if (engine.isProvisionalRow(table, id)) continue;
                     engine.deleteRow(table, id);
                 }
             }
@@ -236,6 +237,8 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
                     "SELECT COUNT(*) AS count FROM sync_outbox WHERE scope_id = ?",
                     [scopeId],
                 )?.count ?? 0;
+            // Provisional results first, also rows they made in other scopes.
+            engine.discardProvisional(scopeId);
             // Find every row first: a child row finds its scope through its parent,
             // so deleting the parent first would leave the child behind.
             const rows = [...engine.specs.keys()].map((table) => [table, rowsOfScope(table)] as const);

@@ -9,7 +9,7 @@ export {
 } from "./client.ts";
 export type { Row, SqlDatabase, SqlValue } from "./database.ts";
 export { addValues, negate } from "./decimal.ts";
-export { migrate, syncEngineSchemaV1, type Migration } from "./migrate.ts";
+export { migrate, syncEngineSchemaV1, syncEngineSchemaV2, type Migration } from "./migrate.ts";
 export type {
     Ack,
     PulledChange,
@@ -22,10 +22,12 @@ export type { CounterSpec, EntitySpec, OperationSpec } from "./spec.ts";
 export {
     createLocalStore,
     MissingRowError,
+    ProvisionalRowError,
     type EngineTable,
     type LocalStore,
     type LocalWriter,
     type OutboxEntry,
+    type ProvisionalWriter,
     type StoreOptions,
     type WriteOptions,
 } from "./store.ts";

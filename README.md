@@ -106,6 +106,49 @@ that throws cannot undo the write: the write returns as usual, and the other
 listeners still run. The error goes to `onListenerError`. By default the store
 throws it again in a microtask, where the app's global error handler sees it.
 
+## Provisional results
+
+Some changes are actions the server runs itself, such as cooking a meal, which
+takes stock and writes movements on the server. The device sends only the
+action, and never the rows the action makes. Until the server's rows arrive,
+it can show the result it expects:
+
+```ts
+store.update("meals", mealId, { status: "consumed" }, {
+    provisional: (local) => {
+        local.insert("movements", { team_id: teamId, stock_id: flourId, delta: "-0.500" });
+        local.add("stock", flourId, "quantity", "-0.500");
+    },
+});
+```
+
+`insert`, `update` and `operate` take the option. `add` works on counters only, the fields operations change, since no write may set them. The provisional writes have no
+outbox entry. A pull that brings one of those rows keeps the provisional delta
+on top, as it keeps queued counters. They go when the server has answered the
+change:
+
+- **Applied:** at the end of the next pull with `has_more: false`, which holds
+  the server's own rows. During a pull of several pages, a pulled row can show
+  both until the last page.
+- **Rejected,** or dropped before it was sent: at once.
+
+A provisional row is read-only. A write to it, a delta on it, a reference to it
+or a row in it as a scope throws a `ProvisionalRowError`;
+`store.isProvisional(table, id)` tells the app before. Removing a row that was
+never sent takes the provisional rows that need it along.
+This needs `syncEngineSchemaV2`, a later migration step than
+`syncEngineSchemaV1`. It adds the `sync_provisional` table and a `merge` column
+on the outbox.
+
+## Account merge
+
+An app that copies rows into an account's scope, such as a guest's data at
+sign-in, writes the copies with `{ merge: true }`. The change goes as an account
+merge (protocol §5.4): the server lands it on a matching row and fills in only
+what that row lacks. The flag is stored with the change, so every resend is the
+same. Later writes to the row queue as normal changes and never merge into the
+copy. This also needs `syncEngineSchemaV2`.
+
 ## Sync
 
 The app supplies the transport, so authentication and the base URL stay in the
