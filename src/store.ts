@@ -512,7 +512,8 @@ function createEngine<T extends string>(
             last !== undefined &&
             unsent(last) &&
             !last.merge &&
-            !entries.some((entry) => entry.position > last.position && entry.op === "delete") &&
+            // Never across a later delete or operation: the server must see this change after it.
+            !entries.some((entry) => entry.position > last.position && entry.op !== "upsert") &&
             !referencesQueuedAfter(entity, fields, last.position);
         if (!mergeable) return append(entity, values, "upsert", fields, dependsOn);
         const files = new Set<string>([...parseList(last.depends_on), ...(dependsOn ?? [])]);

@@ -93,6 +93,11 @@ The scope column is `scope_id` unless you pass `scopeColumn` (for example
 column, such as a child row, passes `scope: (row, db) => ...` in its entity spec
 to say which scope a row belongs to.
 
+Unsent upserts to a row merge into one change, later values winning. They never
+merge across a later delete or operation on that row: a write made after an
+operation is sent after it, so the server applies them in the order they were
+made. An earlier upsert that an operation follows stays as it is.
+
 Deleting a row the server never saw removes it with its queued changes. Rows
 that point at it follow the reference column, as a foreign key would. A
 nullable column is an optional link: it is set to null, in the row and in its
