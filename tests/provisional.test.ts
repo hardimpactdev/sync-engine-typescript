@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSyncClient, type SyncTransport } from "../src/client.ts";
+import { testMigrations } from "./setup.ts";
 import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
 import { createLocalStore, ProvisionalRowError } from "../src/store.ts";
 import { applyAcks, applyPullPage, takeBatch } from "../src/sync.ts";
@@ -462,4 +463,78 @@ test("an operation's local effect cannot point into a provisional row", () => {
             ),
         ProvisionalRowError,
     );
+});
+
+test("a scope found through the entity spec is guarded and followed too", () => {
+    const db = memoryDatabase();
+    migrate(db, [
+        ...testMigrations,
+        `CREATE TABLE entries (sync_id TEXT PRIMARY KEY NOT NULL, owner_scope TEXT NOT NULL, name TEXT NOT NULL,
+            server_id INTEGER, server_seq INTEGER, deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+    ]);
+    let id = 0;
+    const store = createLocalStore(db, {
+        tables: ["scopes", "items", "entries", "counters"],
+        entities: {
+            scopes: { scope: (row) => row.sync_id as string },
+            entries: { scope: (row) => row.owner_scope as string },
+            counters: { operations: { adjust: { counters: [{ field: "quantity", delta: "delta" }] } } },
+        },
+        newId: () => `ID${String(++id).padStart(4, "0")}`,
+    });
+    db.run("INSERT INTO scopes (sync_id, name, server_seq, created_at, updated_at) VALUES (?, 'Home', 1, 'x', 'x')", [scope]);
+    applyPullPage(store, scope, {
+        changes: [
+            { entity: "items", id: cake, seq: 1, op: "upsert", row: { name: "Cake" } },
+            { entity: "counters", id: flour, seq: 2, op: "upsert", row: { name: "Bakes", quantity: 0 } },
+        ],
+        cursor: "c2",
+        has_more: false,
+    });
+    let shelf = "";
+    store.update("items", cake, { notes: "Baked" }, { provisional: (local) => { shelf = local.insert("scopes", { name: "Shelf" }); } });
+
+    assert.throws(() => store.insert("entries", { owner_scope: shelf, name: "Jar" }), ProvisionalRowError);
+    assert.throws(
+        () => store.operate("counters", flour, "adjust", { delta: 1 }, (local) => local.put("entries", "ID9999", { owner_scope: shelf, name: "Jar" })),
+        ProvisionalRowError,
+    );
+    let jar = "";
+    store.operate("counters", flour, "adjust", { delta: 1 }, undefined, {
+        provisional: (local) => {
+            jar = local.insert("entries", { owner_scope: shelf, name: "Jar" });
+        },
+    });
+
+    const [bake] = takeBatch(store, scope);
+    applyAcks(store, scope, [{ change_id: bake.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null } }]);
+
+    assert.equal(store.get("SELECT 1 FROM scopes WHERE sync_id = ?", [shelf]), null);
+    assert.equal(store.get("SELECT 1 FROM entries WHERE sync_id = ?", [jar]), null);
+});
+
+test("a purged scope takes all its provisional results, also rows in other scopes", async () => {
+    const { store } = kitchen();
+    let shelf = "";
+    let room = "";
+    store.update("items", cake, { notes: "Baked" }, {
+        provisional: (local) => {
+            shelf = local.insert("scopes", { name: "Shelf" });
+            room = local.insert("rooms", { scope_id: shelf, name: "Room" });
+            local.add("stock", flour, "quantity", "-2.000");
+        },
+    });
+
+    const outcome = await createSyncClient({
+        store,
+        scopeId: scope,
+        clientId: "01JBC4Y0R8T5D8M4QKX3N2V6ZA",
+        entities: ["items", "rooms", "scopes"],
+        transport: async () => ({ status: 404, body: {} }),
+    }).sync();
+
+    assert.equal(outcome.status, "gone");
+    assert.equal(store.get("SELECT 1 FROM scopes WHERE sync_id = ?", [shelf]), null);
+    assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
+    assert.equal(provisional(store), 0);
 });

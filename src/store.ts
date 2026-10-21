@@ -193,7 +193,7 @@ export function createLocalStore<T extends string>(
             const names = ["sync_id", ...Object.keys(values), "created_at", "updated_at"];
             transaction(() => {
                 engine.guardReferences(entity.references, synced);
-                engine.guardScope(values[engine.scopeColumn]);
+                engine.guardScope(entity.scope({ ...values, sync_id: syncId }, db));
                 db.run(
                     `INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`,
                     [syncId, ...Object.values(values), stamp, stamp],
@@ -749,6 +749,19 @@ function createEngine<T extends string>(
         }
     }
 
+    /**
+     * Takes back every provisional result of a scope, applied or not, for a purge: the
+     * scope's changes will never be answered. Rows made in other scopes go too.
+     */
+    function discardProvisional(scopeId: string) {
+        if (!hasProvisional()) return;
+        const changes = db.all<{ change_id: string }>(
+            "SELECT DISTINCT change_id FROM sync_provisional WHERE scope_id IN (?, ?)",
+            [scopeId, scopeAlias(scopeId)],
+        );
+        for (const { change_id } of changes) settleProvisional(change_id);
+    }
+
     /** The scope a remapped scope became, so a client that still uses the old id settles its results. */
     function scopeAlias(scopeId: string): string {
         return (
@@ -824,7 +837,7 @@ function createEngine<T extends string>(
             const source = specs.get(effect.entity);
             const child = row(effect.entity, effect.row_id);
             if (!source || !child) continue;
-            let goes = child[scopeColumn] === rowId;
+            let goes = source.scope(child, db) === rowId;
             for (const [field, pointsAt] of source.references) {
                 if (goes || pointsAt !== entity || child[field] !== rowId) continue;
                 if (optional(effect.entity, field)) {
@@ -1063,7 +1076,7 @@ function createEngine<T extends string>(
             const entity = spec(table);
             guardRow(table, syncId);
             guardReferences(entity.references, values);
-            guardScope(values[scopeColumn]);
+            guardScope(entity.scope({ ...(row(table, syncId) ?? {}), ...values, sync_id: syncId }, db));
             for (const column of Object.keys(values)) {
                 if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
                 if (conventions.has(column) && column !== scopeColumn) {
@@ -1121,6 +1134,7 @@ function createEngine<T extends string>(
         guardReferences,
         guardScope,
         settleProvisional,
+        discardProvisional,
         ackProvisional,
     };
 }
