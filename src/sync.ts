@@ -244,6 +244,14 @@ export function applyPullPage(store: LocalStore, scopeId: string, page: PullPage
             [scopeId, page.cursor, page.has_more ? 0 : 1, engine.now()],
         );
         engine.touch("sync_state");
+        // The cursor is opaque, so keep the highest seq apart. A poke compares to it.
+        const seq = Math.max(...page.changes.map((change) => change.seq));
+        if (seq > (pulledSeqOf(store, scopeId) ?? 0)) {
+            engine.db.run(
+                "INSERT INTO local_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [pulledSeqKey(scopeId), String(seq)],
+            );
+        }
     });
     return result;
 }
@@ -257,6 +265,16 @@ export function cursorOf(store: LocalStore, scopeId: string): string | null {
         )?.cursor ?? null
     );
 }
+
+/** The highest seq this device has pulled for a scope, or null before it pulled a change. */
+export function pulledSeqOf(store: LocalStore, scopeId: string): number | null {
+    const value = engineOf(store).db.get<{ value: string }>("SELECT value FROM local_meta WHERE key = ?", [
+        pulledSeqKey(scopeId),
+    ])?.value;
+    return value === undefined ? null : Number(value);
+}
+
+export const pulledSeqKey = (scopeId: string) => `sync.pulled_seq.${scopeId}`;
 
 function markState(engine: Engine, scopeId: string, column: "last_push_at") {
     engine.db.run(

@@ -34,6 +34,7 @@ export {
     applyPullPage,
     cursorOf,
     maxBatchSize,
+    pulledSeqOf,
     returnToPending,
     takeBatch,
     type AckResult,
@@ -41,6 +42,13 @@ export {
     type RejectedChange,
     type TakeBatchOptions,
 } from "./sync.ts";
+export {
+    createRealtimeSync,
+    type RealtimeConnection,
+    type RealtimeSync,
+    type RealtimeSyncOptions,
+    type SyncPoke,
+} from "./realtime.ts";
 export {
     createSyncScheduler,
     type SyncScheduler,

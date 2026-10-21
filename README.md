@@ -12,6 +12,8 @@ in SQLite on the device. The server half is the Laravel package
   them until the server confirms them.
 - **Scheduler:** syncs soon after a write, at once on a poke or when the app
   comes back, and backs off after a failure.
+- **Realtime:** turns the app's socket pokes and connection state into
+  scheduler triggers, with a timer while the socket is down.
 - **React hooks (optional):** `useLocalQuery` reads local data and renders
   again when its tables change. Reads are synchronous, so a screen has its data
   on the first render.
@@ -127,7 +129,6 @@ const client = createSyncClient({
 const scheduler = createSyncScheduler({ client, onOutcome: (outcome) => console.log(outcome.status) });
 
 scheduler.trigger("start");
-echo.private(`sync.${teamId}`).listen(".scope.changed", () => scheduler.trigger("poke"));
 ```
 
 Call `scheduler.trigger("write")` after each local write. The scheduler waits
@@ -135,6 +136,36 @@ briefly after a write so a burst goes in one push, syncs at once on other
 triggers (`foreground`, `network`, `poke`, `manual`) and backs off
 after a failure. Call `scheduler.stop()` and `await scheduler.idle()` before you
 close the database.
+
+## Realtime
+
+`createRealtimeSync` decides when a poke or a reconnect needs a pull. The app
+owns the socket and passes in two things:
+
+- `poke(event)`: each `scope.changed` event, `{ seq, client_id }`. A poke from
+  this install, or with a seq this device has pulled already, does nothing.
+  Otherwise it calls `scheduler.trigger("poke")`.
+- `connection(state)`: `"connected"` or `"disconnected"`. Every change to
+  connected calls `scheduler.trigger("network")`, to cover pokes missed while
+  away. While disconnected, a timer triggers `"network"` every `intervalMs`
+  (default 60 s). It starts disconnected.
+
+With Laravel Echo and pusher-js (or Reverb):
+
+```ts
+import { createRealtimeSync } from "@hardimpactdev/sync-engine";
+
+const realtime = createRealtimeSync({ scheduler, store, scopeId: teamId, clientId });
+const connection = echo.connector.pusher.connection;
+const state = (current: string) => realtime.connection(current === "connected" ? "connected" : "disconnected");
+
+echo.private(`sync.${teamId}`).listen(".scope.changed", realtime.poke);
+connection.bind("state_change", ({ current }: { current: string }) => state(current));
+state(connection.state);
+```
+
+The package does not depend on Echo, pusher-js or any socket library. Call
+`realtime.stop()` before `scheduler.stop()`.
 
 ## React
 
