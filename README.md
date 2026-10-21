@@ -134,8 +134,10 @@ change:
 
 A provisional row is read-only. A write to it, a delta on it, a reference to it
 or a row in it as a scope throws a `ProvisionalRowError`;
-`store.isProvisional(table, id)` tells the app before. Removing a row that was
-never sent takes the provisional rows that need it along.
+`store.isProvisional(table, id)` tells the app before. Whenever a row goes, by a
+remove, a pulled tombstone, an acked delete, a refused insert, a resync sweep or
+a purge, the provisional rows that need it follow as through a foreign key: an
+optional link is cleared, a required link takes the provisional row along.
 This needs `syncEngineSchemaV2`, a later migration step than
 `syncEngineSchemaV1`. It adds the `sync_provisional` table and a `merge` column
 on the outbox.

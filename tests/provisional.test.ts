@@ -3,7 +3,7 @@ import test from "node:test";
 import { createSyncClient, type SyncTransport } from "../src/client.ts";
 import { testMigrations } from "./setup.ts";
 import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
-import { createLocalStore, ProvisionalRowError } from "../src/store.ts";
+import { createLocalStore, ProvisionalRowError, type ProvisionalWriter } from "../src/store.ts";
 import { applyAcks, applyPullPage, takeBatch } from "../src/sync.ts";
 import { memoryDatabase } from "./memory-database.ts";
 import { outbox, pulled, scope, setup, type Store } from "./setup.ts";
@@ -665,4 +665,102 @@ test("a provisional delta lands only on a counter, which no write can overwrite"
         /is a counter/,
     );
     assert.equal(quantity(store), "5.000");
+});
+
+/** A change that waits for a file, so no drained pull settles its provisional rows. */
+function waitingAction(store: Store, write: (local: ProvisionalWriter) => void) {
+    store.update("items", cake, { notes: "Baked" }, { dependsOn: ["offline-photo"], provisional: write });
+}
+
+test("a pulled tombstone takes the provisional rows that need the deleted row, and clears optional links", () => {
+    const { store } = kitchen();
+    const jar = "01JBC59ZQ0B2D4F6H8K0M2P4S7";
+    const pantry = "01JBC59ZQ0B2D4F6H8K0M2P4S8";
+    pulled(store, "items", jar, { name: "Jar" }, 3);
+    pulled(store, "rooms", pantry, { name: "Pantry" }, 4);
+    let lid = "";
+    let tin = "";
+    waitingAction(store, (local) => {
+        lid = local.insert("parts", { scope_id: scope, item_id: jar, name: "Lid" });
+        tin = local.insert("items", { scope_id: scope, name: "Tin", room_id: pantry });
+    });
+    let heard = 0;
+    store.subscribe(["parts", "items"], () => heard++);
+
+    applyPullPage(store, scope, {
+        changes: [
+            { entity: "items", id: jar, seq: 5, op: "delete" },
+            { entity: "rooms", id: pantry, seq: 6, op: "delete" },
+        ],
+        cursor: "c6",
+        has_more: false,
+    });
+
+    assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [lid]), null);
+    assert.equal(store.isProvisional("parts", lid), false);
+    assert.equal(store.get<{ room_id: string | null }>("SELECT room_id FROM items WHERE sync_id = ?", [tin])?.room_id, null);
+    assert.equal(store.isProvisional("items", tin), true);
+    assert.equal(heard, 1);
+});
+
+test("a resync sweep takes the provisional rows that need a swept row", async () => {
+    const { store } = kitchen();
+    const jar = "01JBC59ZQ0B2D4F6H8K0M2P4S9";
+    pulled(store, "items", jar, { name: "Jar" }, 3);
+    let lid = "";
+    waitingAction(store, (local) => {
+        lid = local.insert("parts", { scope_id: scope, item_id: jar, name: "Lid" });
+    });
+    let request = 0;
+    const transport: SyncTransport = async () => {
+        request++;
+        if (request === 1) return { status: 409, body: { error: { code: "resync_required", message: "Again." } } };
+        return {
+            status: 200,
+            body: {
+                protocol: 1,
+                acks: [],
+                changes: [{ entity: "items", id: cake, seq: 9, op: "upsert", row: { name: "Cake" } }],
+                cursor: "c9",
+                has_more: false,
+                server_time: "x",
+            },
+        };
+    };
+
+    await createSyncClient({
+        store,
+        scopeId: scope,
+        clientId: "01JBC4Y0R8T5D8M4QKX3N2V6ZA",
+        entities: ["items", "parts"],
+        transport,
+        isUploaded: () => false,
+    }).sync();
+
+    assert.equal(store.get("SELECT 1 FROM items WHERE sync_id = ?", [jar]), null);
+    assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [lid]), null);
+});
+
+test("an acked delete and a refused insert take the provisional rows that need them", () => {
+    const { store } = kitchen();
+    const jar = "01JBC59ZQ0B2D4F6H8K0M2P4T2";
+    pulled(store, "items", jar, { name: "Jar" }, 3);
+    const box = store.insert("items", { scope_id: scope, name: "Box" });
+    let lid = "";
+    let flap = "";
+    waitingAction(store, (local) => {
+        lid = local.insert("parts", { scope_id: scope, item_id: jar, name: "Lid" });
+        flap = local.insert("parts", { scope_id: scope, item_id: box, name: "Flap" });
+    });
+    store.remove("items", jar);
+
+    const batch = takeBatch(store, scope, { isUploaded: () => false });
+    const changeFor = (id: string) => batch.find((change) => change.id === id)!.change_id;
+    applyAcks(store, scope, [
+        { change_id: changeFor(jar), status: "applied", seq: 4 },
+        { change_id: changeFor(box), status: "rejected", error: { code: "validation", message: "No." }, current: null },
+    ]);
+
+    assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [lid]), null);
+    assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [flap]), null);
 });

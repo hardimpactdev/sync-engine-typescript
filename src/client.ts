@@ -222,7 +222,7 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
                     if (seen.has(`${table}:${id}`)) continue;
                     if (engine.entriesFor(table, id).length) continue;
                     if (engine.isProvisionalRow(table, id)) continue;
-                    engine.deleteRow(table, id);
+                    engine.deleteWithProvisional(table, id);
                 }
             }
             setResync(false);
@@ -243,7 +243,7 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
             // so deleting the parent first would leave the child behind.
             const rows = [...engine.specs.keys()].map((table) => [table, rowsOfScope(table)] as const);
             for (const [table, list] of rows) {
-                for (const row of list) engine.deleteRow(table, row.sync_id as string);
+                for (const row of list) engine.deleteWithProvisional(table, row.sync_id as string);
             }
             engine.db.run("DELETE FROM sync_outbox WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM sync_rejected WHERE scope_id = ?", [scopeId]);

@@ -1148,6 +1148,7 @@ function createEngine<T extends string>(
         columns,
         row,
         deleteRow,
+        deleteWithProvisional,
         checkWrite,
         entriesFor,
         unsent,
