@@ -111,7 +111,7 @@ test("a cancelled insert clears an optional link to it and keeps the row", () =>
     assert.equal(field(store, "items", lamp, "room_id"), null);
 });
 
-test("a cancelled insert takes the operations that point at it along", () => {
+test("an operation keeps its row and loses an optional link to a cancelled insert", () => {
     const { store } = setup();
     const rice = store.insert("stock", { scope_id: scope, name: "Rice" });
     const movement = store.newId();
@@ -119,8 +119,12 @@ test("a cancelled insert takes the operations that point at it along", () => {
         local.put("movements", movement, { scope_id: scope, stock_id: rice, delta: "1.500" }),
     );
     store.remove("stock", rice);
-    assert.deepEqual(outbox(store), []);
-    assert.equal(store.all("SELECT * FROM movements").length, 0);
+    // movements.stock_id is nullable, so the movement stays, as with ON DELETE SET NULL.
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.op, entry.payload]),
+        [["record", { stock_id: null, delta: "1.500" }]],
+    );
+    assert.equal(field(store, "movements", movement, "stock_id"), null);
 });
 
 test("a cancelled insert keeps a change the server may have seen", () => {

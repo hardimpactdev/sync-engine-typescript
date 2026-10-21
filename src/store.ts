@@ -535,8 +535,10 @@ function createEngine<T extends string>(
      *   change that inserted that row cancels it in turn (`ON DELETE CASCADE`).
      *   A later upsert of a row that stays is kept; the server rejects it with
      *   the row's current values, and the device restores the row from them.
-     * - An operation that points at the row is dropped, with its deltas. One
-     *   that made its own row cancels that row.
+     * - An operation follows the same rule for its arguments, by the column of
+     *   the same name in its own table: an optional link is cleared and the
+     *   operation stays; otherwise it is dropped with its deltas, and one that
+     *   made its own row cancels that row.
      */
     function cancel(entity: string, rowId: string) {
         drop(entriesFor(entity, rowId));
@@ -554,8 +556,7 @@ function createEngine<T extends string>(
                 mention.position,
             ]);
             if (!entry) continue;
-            // Operations always go; an upsert goes only for a required link.
-            if (entry.op === "upsert" && !clearOptionalFields(entry, entity, rowId)) continue;
+            if (!clearOptionalFields(entry, entity, rowId)) continue;
             const child = row(entry.entity, entry.row_id);
             const entries = entriesFor(entry.entity, entry.row_id);
             if (child && !knownToServer(child, entries) && entries[0].position === entry.position) {
@@ -596,17 +597,26 @@ function createEngine<T extends string>(
     }
 
     /**
-     * Clears the optional links of an unsent upsert to a removed row. Returns
-     * whether a required link to it is left.
+     * Clears the optional links of an unsent change to a removed row, in its
+     * payload and in its own row. Returns whether a required link is left.
      */
     function clearOptionalFields(entry: OutboxEntry, entity: string, rowId: string): boolean {
+        const source = spec(entry.entity);
+        const references =
+            entry.op === "upsert"
+                ? source.references
+                : (source.operations.get(entry.op)?.references ?? new Map<string, string>());
         const payload = JSON.parse(entry.payload) as Row;
         let cleared = false;
         let required = false;
-        for (const [field, pointsAt] of spec(entry.entity).references) {
+        for (const [field, pointsAt] of references) {
             if (pointsAt !== entity || payload[field] !== rowId) continue;
             if (optional(entry.entity, field)) {
                 payload[field] = null;
+                db.run(
+                    `UPDATE ${entry.entity} SET ${field} = NULL WHERE sync_id = ? AND ${field} = ?`,
+                    [entry.row_id, rowId],
+                );
                 cleared = true;
             } else {
                 required = true;
@@ -618,6 +628,7 @@ function createEngine<T extends string>(
                 entry.position,
             ]);
             touch("sync_outbox");
+            touch(entry.entity);
         }
         return required;
     }
