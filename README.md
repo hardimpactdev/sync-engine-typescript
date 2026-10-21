@@ -101,6 +101,11 @@ row that it made goes too. An operation's arguments follow the column of the
 same name in the operation's own table: a nullable one is cleared and the
 operation stays; otherwise the operation is dropped with its deltas.
 
+After a commit the store calls the listeners of the changed tables. A listener
+that throws cannot undo the write: the write returns as usual, and the other
+listeners still run. The error goes to `onListenerError`. By default the store
+throws it again in a microtask, where the app's global error handler sees it.
+
 ## Sync
 
 The app supplies the transport, so authentication and the base URL stay in the

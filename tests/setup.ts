@@ -50,7 +50,10 @@ export type Table = (typeof tables)[number];
 export const scope = "01J9XX0A1B2C3D4E5F6G7H8J9K";
 
 /** A store on a fresh database. `ids` come first from newId; `at` fixes the clock. */
-export function setup({ ids = [] }: { ids?: string[] } = {}) {
+export function setup({
+    ids = [],
+    onListenerError,
+}: { ids?: string[]; onListenerError?: (error: unknown) => void } = {}) {
     const db = memoryDatabase();
     migrate(db, testMigrations);
     let id = 0;
@@ -76,6 +79,7 @@ export function setup({ ids = [] }: { ids?: string[] } = {}) {
         },
         newId: () => queue.shift() ?? `ID${String(++id).padStart(4, "0")}`,
         now: () => fixed ?? new Date(Date.UTC(2026, 9, 20, 9, 0, clock++)).toISOString(),
+        onListenerError,
     });
     db.run(
         "INSERT INTO scopes (sync_id, name, server_seq, created_at, updated_at) VALUES (?, 'Home', 1, 'x', 'x')",

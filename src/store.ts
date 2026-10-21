@@ -4,7 +4,9 @@ import type { CounterSpec, EntitySpec } from "./spec.ts";
 
 // Every write to synced data goes through the store. In one transaction it
 // changes the row and writes or merges its outbox entry (protocol §6). After
-// commit it tells the screens that read those tables.
+// commit it tells the screens that read those tables. A listener that throws
+// cannot undo a commit, so its error goes to onListenerError, and the write and
+// the other listeners go on.
 
 /** Engine tables a screen may subscribe to, such as a count of unsent changes. */
 export type EngineTable = "sync_outbox" | "sync_rejected" | "sync_state";
@@ -17,6 +19,8 @@ export type StoreOptions<T extends string> = {
     scopeColumn?: string;
     newId: () => string;
     now?: () => string;
+    /** Gets an error a listener threw after a commit. By default it is thrown again in a microtask. */
+    onListenerError?: (error: unknown) => void;
 };
 
 export type WriteOptions = {
@@ -227,6 +231,7 @@ function createEngine<T extends string>(
         scopeColumn = "scope_id",
         newId,
         now = () => new Date().toISOString(),
+        onListenerError = rethrowLater,
     }: StoreOptions<T>,
 ) {
     if (!plainName.test(scopeColumn)) throw new Error(`${scopeColumn} is not a column name.`);
@@ -256,14 +261,12 @@ function createEngine<T extends string>(
         const savepoint = `level_${depth}`;
         db.exec(outer ? "BEGIN IMMEDIATE" : `SAVEPOINT ${savepoint}`);
         depth++;
+        let result: R;
         try {
-            const result = work();
+            result = work();
+            // COMMIT can fail too, such as on a deferred foreign key, so it stays inside the try.
             db.exec(outer ? "COMMIT" : `RELEASE ${savepoint}`);
-            depth--;
-            if (outer) notify();
-            return result;
         } catch (failure) {
-            depth--;
             if (outer) {
                 db.exec("ROLLBACK");
                 touched.clear();
@@ -272,19 +275,27 @@ function createEngine<T extends string>(
                 db.exec(`RELEASE ${savepoint}`);
             }
             throw failure;
+        } finally {
+            depth--;
         }
+        if (outer) notify();
+        return result;
     }
 
     function notify() {
         const changed = [...touched];
         touched.clear();
+        for (const table of changed) versions.set(table, (versions.get(table) ?? 0) + 1);
         const called = new Set<() => void>();
         for (const table of changed) {
-            versions.set(table, (versions.get(table) ?? 0) + 1);
             for (const listener of listeners.get(table) ?? []) {
                 if (called.has(listener)) continue;
                 called.add(listener);
-                listener();
+                try {
+                    listener();
+                } catch (error) {
+                    onListenerError(error);
+                }
             }
         }
     }
@@ -867,6 +878,13 @@ function resolveSpecs(
         }
     }
     return specs;
+}
+
+/** Throws the error outside the write, where the app's global error handler sees it. */
+function rethrowLater(error: unknown) {
+    queueMicrotask(() => {
+        throw error;
+    });
 }
 
 function parseList(json: string | null): string[] {
