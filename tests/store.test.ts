@@ -448,6 +448,58 @@ test("listeners hear about their tables once per commit", () => {
     assert.deepEqual(heard.sort(), ["counters", "inventory", "outbox", "outbox", "outbox"]);
 });
 
+test("a listener that throws does not undo the commit or break later writes", () => {
+    const reported: unknown[] = [];
+    const { store } = setup({ onListenerError: (error) => reported.push(error) });
+    const heard: string[] = [];
+    const stop = store.subscribe(["rooms"], () => {
+        throw new Error("broken screen");
+    });
+    store.subscribe(["rooms", "items"], () => heard.push("other"));
+    const rooms = store.version(["rooms"]);
+    const items = store.version(["items"]);
+
+    // The write committed, so it returns as usual; the listener's error is reported apart.
+    store.transaction(() => {
+        room(store, "Garage");
+        store.insert("items", { scope_id: scope, name: "Bike" });
+    });
+    assert.deepEqual(
+        reported.map((error) => (error as Error).message),
+        ["broken screen"],
+    );
+    assert.deepEqual(heard, ["other"]);
+    assert.notEqual(store.version(["rooms"]), rooms);
+    assert.notEqual(store.version(["items"]), items);
+
+    stop();
+    room(store, "Shed");
+    assert.deepEqual(
+        store.all<{ name: string }>("SELECT name FROM rooms ORDER BY name").map((row) => row.name),
+        ["Garage", "Shed"],
+    );
+    assert.equal(outbox(store).filter((entry) => entry.entity === "rooms").length, 2);
+    assert.deepEqual(heard, ["other", "other"]);
+});
+
+test("by default a listener error is thrown again in a microtask", () => {
+    const { store } = setup();
+    const later: (() => void)[] = [];
+    const queue = globalThis.queueMicrotask;
+    globalThis.queueMicrotask = (callback) => later.push(callback);
+    try {
+        store.subscribe(["rooms"], () => {
+            throw new Error("broken screen");
+        });
+        room(store, "Garage");
+    } finally {
+        globalThis.queueMicrotask = queue;
+    }
+    assert.equal(later.length, 1);
+    assert.throws(later[0]!, /broken screen/);
+    assert.equal(outbox(store).length, 1);
+});
+
 test("an app may keep the scope in a column of its own", async () => {
     const db = memoryDatabase();
     migrate(db, [
