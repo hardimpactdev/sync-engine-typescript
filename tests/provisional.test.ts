@@ -146,15 +146,87 @@ test("a rejected change takes its provisional result back", () => {
     assert.equal(store.get<{ notes: string | null }>("SELECT notes FROM items")?.notes, null);
 });
 
-test("dropping an unsent change takes its provisional result back", () => {
+test("removing a row keeps its unsent action, which goes before the delete", () => {
     const { store } = kitchen();
     bake(store);
 
     store.remove("items", cake);
 
-    assert.equal(quantity(store), "5.000");
-    assert.equal(movements(store).length, 0);
+    // The action stays: the server runs it once (or finds it done), then deletes the row.
+    assert.equal(quantity(store), "3.000");
+    assert.equal(movements(store).length, 1);
+    assert.deepEqual(
+        takeBatch(store, scope).map((change) => [change.entity, change.op, change.fields ?? null]),
+        [
+            ["items", "upsert", { notes: "Baked" }],
+            ["items", "delete", null],
+        ],
+    );
+    assert.equal(store.get("SELECT deleted_at FROM items WHERE sync_id = ?", [cake]) !== null, true);
+});
+
+test("removing a row the server never saw keeps its action and the insert it needs", () => {
+    const { store } = kitchen();
+    const pie = store.insert(
+        "items",
+        { scope_id: scope, name: "Pie" },
+        { provisional: (local) => local.add("stock", flour, "quantity", "-1.000") },
+    );
+
+    store.remove("items", pie);
+
+    assert.equal(quantity(store), "4.000");
+    assert.deepEqual(
+        takeBatch(store, scope).map((change) => [change.op, change.fields ?? null]),
+        [
+            ["upsert", { name: "Pie" }],
+            ["delete", null],
+        ],
+    );
+});
+
+test("removing a row without an action still drops its unsent changes", () => {
+    const { store } = kitchen();
+    store.update("items", cake, { notes: "Iced" });
+    const pie = store.insert("items", { scope_id: scope, name: "Pie" });
+
+    store.remove("items", cake);
+    store.remove("items", pie);
+
+    assert.deepEqual(
+        takeBatch(store, scope).map((change) => [change.id, change.op]),
+        [[cake, "delete"]],
+    );
+});
+
+test("an action kept by a remove settles after the server answers both", () => {
+    const { store } = kitchen();
+    bake(store);
+    store.remove("items", cake);
+    const batch = takeBatch(store, scope);
+
+    applyAcks(
+        store,
+        scope,
+        batch.map((change, index) => ({ change_id: change.change_id, status: "applied" as const, seq: 3 + index })),
+    );
+    applyPullPage(store, scope, {
+        changes: [
+            { entity: "movements", id: serverMovement, seq: 5, op: "upsert", row: { stock_id: flour, delta: "-2.000" } },
+            { entity: "stock", id: flour, seq: 6, op: "upsert", row: { name: "Flour", quantity: "3.000" } },
+            { entity: "items", id: cake, seq: 7, op: "delete" },
+        ],
+        cursor: "c7",
+        has_more: false,
+    });
+
+    assert.equal(quantity(store), "3.000");
+    assert.deepEqual(
+        movements(store).map((movement) => movement.sync_id),
+        [serverMovement],
+    );
     assert.equal(provisional(store), 0);
+    assert.equal(store.get("SELECT 1 FROM items WHERE sync_id = ?", [cake]), null);
 });
 
 test("later edits merged into the change keep its provisional result", () => {
@@ -763,4 +835,29 @@ test("an acked delete and a refused insert take the provisional rows that need t
 
     assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [lid]), null);
     assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [flap]), null);
+});
+
+test("removing a new row keeps it when a new row that needs it carries an action", () => {
+    const { store } = kitchen();
+    const jar = store.insert("items", { scope_id: scope, name: "Jar" });
+    const lid = store.insert(
+        "parts",
+        { scope_id: scope, item_id: jar, name: "Lid" },
+        { provisional: (local) => local.add("stock", flour, "quantity", "-1.000") },
+    );
+
+    store.remove("parts", lid);
+    store.remove("items", jar);
+
+    // The lid's action needs the jar on the server, so both go, then both deletes.
+    assert.equal(quantity(store), "4.000");
+    assert.deepEqual(
+        takeBatch(store, scope).map((change) => [change.entity, change.op]),
+        [
+            ["items", "upsert"],
+            ["parts", "upsert"],
+            ["parts", "delete"],
+            ["items", "delete"],
+        ],
+    );
 });

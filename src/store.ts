@@ -71,7 +71,11 @@ export interface LocalStore<T extends string = string> {
     /** Adds a row and returns its sync_id. */
     insert(table: T, values: Row, options?: WriteOptions): string;
     update(table: T, syncId: string, patch: Row, options?: WriteOptions): void;
-    /** Deletes a row. A row the server knows stays hidden until the delete is acked. */
+    /**
+     * Deletes a row. A row the server knows stays hidden until the delete is acked. An
+     * unsent change with a provisional result (an action) is kept and sent before the
+     * delete, also for a row the server never saw.
+     */
     remove(table: T, syncId: string): void;
     /**
      * Records a named operation, such as `adjust {delta}`. The store first runs
@@ -241,12 +245,24 @@ export function createLocalStore<T extends string>(
                 if (!row || row.deleted_at !== null) throw new MissingRowError(table, syncId);
                 engine.guardRow(table, syncId);
                 const entries = engine.entriesFor(table, syncId);
-                if (!engine.knownToServer(row, entries)) {
+                // A change with a provisional result is an action the user took, such as a
+                // cook. It stays, with the changes it builds on: the server runs it, then
+                // the delete. Dropping it would take back a result the server may already
+                // have from another device, or turn it into a second, unrelated change.
+                const known = engine.knownToServer(row, entries);
+                const action =
+                    entries.some(
+                        (entry) => engine.unsent(entry) && engine.carriesProvisional(entry.change_id),
+                    ) ||
+                    // Cancelling a row the server never saw also cancels the new rows that need
+                    // it; keep it when one of those carries an action.
+                    (!known && engine.actionNeeds(table, syncId));
+                if (!action && !known) {
                     // An unsent insert and its delete cancel out.
                     engine.cancel(table, syncId);
                     return;
                 }
-                engine.drop(entries.filter((entry) => engine.unsent(entry)));
+                if (!action) engine.drop(entries.filter((entry) => engine.unsent(entry)));
                 engine.append(entity, row, "delete", {});
                 const stamp = now();
                 db.run(`UPDATE ${table} SET deleted_at = ?, updated_at = ? WHERE sync_id = ?`, [
@@ -773,6 +789,47 @@ function createEngine<T extends string>(
         );
     }
 
+    /** Whether a change carries a provisional result. */
+    function carriesProvisional(changeId: string): boolean {
+        return (
+            hasProvisional() &&
+            db.get("SELECT 1 FROM sync_provisional WHERE change_id = ? LIMIT 1", [changeId]) !== null
+        );
+    }
+
+    /**
+     * Whether an unsent action needs this row the server never saw: an unsent row with a
+     * required link to it, which carries an action or is needed by one in turn.
+     */
+    function actionNeeds(entity: string, rowId: string, seen = new Set<string>()): boolean {
+        const key = `${entity}:${rowId}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        const mentions = db.all<OutboxEntry>(
+            "SELECT * FROM sync_outbox WHERE state = 'pending' AND attempts = 0 AND instr(payload, ?) > 0 ORDER BY position",
+            [rowId],
+        );
+        for (const mention of mentions) {
+            const source = spec(mention.entity);
+            const references =
+                mention.op === "upsert"
+                    ? source.references
+                    : (source.operations.get(mention.op)?.references ?? new Map<string, string>());
+            const payload = JSON.parse(mention.payload) as Row;
+            const required = [...references].some(
+                ([field, pointsAt]) =>
+                    pointsAt === entity && payload[field] === rowId && !optional(mention.entity, field),
+            );
+            if (!required) continue;
+            const child = row(mention.entity, mention.row_id);
+            const childEntries = entriesFor(mention.entity, mention.row_id);
+            if (childEntries.some((entry) => unsent(entry) && carriesProvisional(entry.change_id))) return true;
+            if (child && !knownToServer(child, childEntries) && actionNeeds(mention.entity, mention.row_id, seen))
+                return true;
+        }
+        return false;
+    }
+
     /** The server applied the change: its result arrives with the next drained pull. */
     function ackProvisional(changeId: string) {
         if (hasProvisional()) db.run("UPDATE sync_provisional SET acked = 1 WHERE change_id = ?", [changeId]);
@@ -1170,6 +1227,8 @@ function createEngine<T extends string>(
         settleProvisional,
         discardProvisional,
         ackProvisional,
+        carriesProvisional,
+        actionNeeds,
     };
 }
 
