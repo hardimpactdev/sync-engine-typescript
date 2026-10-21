@@ -836,3 +836,28 @@ test("an acked delete and a refused insert take the provisional rows that need t
     assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [lid]), null);
     assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [flap]), null);
 });
+
+test("removing a new row keeps it when a new row that needs it carries an action", () => {
+    const { store } = kitchen();
+    const jar = store.insert("items", { scope_id: scope, name: "Jar" });
+    const lid = store.insert(
+        "parts",
+        { scope_id: scope, item_id: jar, name: "Lid" },
+        { provisional: (local) => local.add("stock", flour, "quantity", "-1.000") },
+    );
+
+    store.remove("parts", lid);
+    store.remove("items", jar);
+
+    // The lid's action needs the jar on the server, so both go, then both deletes.
+    assert.equal(quantity(store), "4.000");
+    assert.deepEqual(
+        takeBatch(store, scope).map((change) => [change.entity, change.op]),
+        [
+            ["items", "upsert"],
+            ["parts", "upsert"],
+            ["parts", "delete"],
+            ["items", "delete"],
+        ],
+    );
+});

@@ -134,7 +134,8 @@ change:
 
 Removing a row keeps its unsent action, also when the server never saw the
 row: the action, with the changes it builds on, goes before the delete, so the
-server runs it once and nothing is taken back or counted twice.
+server runs it once and nothing is taken back or counted twice. A row the server
+never saw is kept the same way when a new row that needs it carries an action.
 
 A provisional row is read-only. A write to it, a delta on it, a reference to it
 or a row in it as a scope throws a `ProvisionalRowError`;
