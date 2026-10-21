@@ -209,3 +209,7 @@ sets that version and publishes it to npm with provenance.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Node.js runtime
+
+Use Node.js `24.22.1`, pinned in `.node-version`. This includes the [October 21, 2026 security fixes](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases). CI reads the same version file. Select the pinned version before running the package tests or publishing.
