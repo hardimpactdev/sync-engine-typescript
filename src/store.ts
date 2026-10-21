@@ -236,6 +236,7 @@ function createEngine<T extends string>(
     const versions = new Map<string, number>();
     const listeners = new Map<string, Set<() => void>>();
     const columnCache = new Map<string, Set<string>>();
+    const nullableCache = new Map<string, Set<string>>();
 
     const specs = resolveSpecs(tables, entities as Partial<Record<string, EntitySpec>>, scopeColumn);
     // For each entity, the queued operations whose counters land on its rows.
@@ -525,25 +526,36 @@ function createEngine<T extends string>(
     }
 
     /**
-     * Removes a row the server never saw, with its queued changes. Unsent
-     * changes that point at the row go too, or the server would reject them.
-     * A change that made its own row cancels that row in turn, and an
-     * operation is dropped. A later upsert of a row that stays is kept: the
-     * server rejects it with the row's current values, and the device
-     * restores the row from them.
+     * Removes a row the server never saw, with its queued changes. What points
+     * at it follows the reference's column, as a database's foreign key would:
+     *
+     * - An optional link (a nullable column) is cleared, in the rows and in
+     *   unsent changes, and the row stays (`ON DELETE SET NULL`).
+     * - A required link (`NOT NULL`) takes along a new row that it made: the
+     *   change that inserted that row cancels it in turn (`ON DELETE CASCADE`).
+     *   A later upsert of a row that stays is kept; the server rejects it with
+     *   the row's current values, and the device restores the row from them.
+     * - An operation that points at the row is dropped, with its deltas. One
+     *   that made its own row cancels that row.
      */
     function cancel(entity: string, rowId: string) {
         drop(entriesFor(entity, rowId));
         deleteRow(entity, rowId);
+        clearLinks(entity, rowId);
         const key = `${entity}:${rowId}`;
         const mentions = db.all<OutboxEntry>(
             "SELECT * FROM sync_outbox WHERE state = 'pending' AND attempts = 0 AND instr(payload, ?) > 0 ORDER BY position",
             [rowId],
         );
-        for (const entry of mentions) {
-            if (!referencesOf(entry).includes(key)) continue;
+        for (const mention of mentions) {
+            if (!referencesOf(mention).includes(key)) continue;
             // A cancel earlier in this loop may have removed it already.
-            if (!db.get("SELECT 1 FROM sync_outbox WHERE position = ?", [entry.position])) continue;
+            const entry = db.get<OutboxEntry>("SELECT * FROM sync_outbox WHERE position = ?", [
+                mention.position,
+            ]);
+            if (!entry) continue;
+            // Operations always go; an upsert goes only for a required link.
+            if (entry.op === "upsert" && !clearOptionalFields(entry, entity, rowId)) continue;
             const child = row(entry.entity, entry.row_id);
             const entries = entriesFor(entry.entity, entry.row_id);
             if (child && !knownToServer(child, entries) && entries[0].position === entry.position) {
@@ -552,6 +564,62 @@ function createEngine<T extends string>(
             }
             if (entry.op !== "upsert") drop([entry]);
         }
+    }
+
+    /** Whether a reference column may hold null. A field that is no column counts as required. */
+    function optional(table: string, field: string): boolean {
+        let found = nullableCache.get(table);
+        if (!found) {
+            found = new Set(
+                db
+                    .all<{ name: string; notnull: number }>(`PRAGMA table_info(${table})`)
+                    .filter((column) => column.notnull === 0)
+                    .map((column) => column.name),
+            );
+            nullableCache.set(table, found);
+        }
+        return found.has(field);
+    }
+
+    /** Sets optional links to a removed row to null in every synced table. */
+    function clearLinks(entity: string, rowId: string) {
+        for (const source of specs.values()) {
+            for (const [field, pointsAt] of source.references) {
+                if (pointsAt !== entity || !optional(source.name, field)) continue;
+                const { changes } = db.run(
+                    `UPDATE ${source.name} SET ${field} = NULL WHERE ${field} = ?`,
+                    [rowId],
+                );
+                if (changes > 0) touch(source.name);
+            }
+        }
+    }
+
+    /**
+     * Clears the optional links of an unsent upsert to a removed row. Returns
+     * whether a required link to it is left.
+     */
+    function clearOptionalFields(entry: OutboxEntry, entity: string, rowId: string): boolean {
+        const payload = JSON.parse(entry.payload) as Row;
+        let cleared = false;
+        let required = false;
+        for (const [field, pointsAt] of spec(entry.entity).references) {
+            if (pointsAt !== entity || payload[field] !== rowId) continue;
+            if (optional(entry.entity, field)) {
+                payload[field] = null;
+                cleared = true;
+            } else {
+                required = true;
+            }
+        }
+        if (cleared) {
+            db.run("UPDATE sync_outbox SET payload = ? WHERE position = ?", [
+                JSON.stringify(payload),
+                entry.position,
+            ]);
+            touch("sync_outbox");
+        }
+        return required;
     }
 
     /**
