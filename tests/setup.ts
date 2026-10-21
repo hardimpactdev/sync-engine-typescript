@@ -40,10 +40,11 @@ export const testMigrations = [
     CREATE TABLE counters (${row}, name TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE stock (${row}, name TEXT NOT NULL, quantity TEXT NOT NULL DEFAULT '0.000');
     CREATE TABLE movements (${row}, stock_id TEXT, delta TEXT NOT NULL);
+    CREATE TABLE parts (${row}, item_id TEXT NOT NULL, name TEXT NOT NULL);
     `,
 ];
 
-export const tables = ["scopes", "rooms", "items", "counters", "stock", "movements"] as const;
+export const tables = ["scopes", "rooms", "items", "counters", "stock", "movements", "parts"] as const;
 export type Table = (typeof tables)[number];
 
 export const scope = "01J9XX0A1B2C3D4E5F6G7H8J9K";
@@ -60,7 +61,9 @@ export function setup({ ids = [] }: { ids?: string[] } = {}) {
         tables,
         entities: {
             scopes: { scope: (values) => values.sync_id as string },
+            // items.room_id is nullable: an optional link. parts.item_id is NOT NULL: a required one.
             items: { references: { room_id: "rooms" }, serverOwned: ["illustration"] },
+            parts: { references: { item_id: "items" } },
             counters: { operations: { adjust: { counters: [{ field: "quantity", delta: "delta" }] } } },
             movements: {
                 writable: [],

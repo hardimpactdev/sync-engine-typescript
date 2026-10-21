@@ -7,6 +7,10 @@ import { applyPullPage, returnToPending, takeBatch } from "../src/sync.ts";
 import { memoryDatabase } from "./memory-database.ts";
 import { scope, outbox, pulled, setup, tables, testMigrations, type Store } from "./setup.ts";
 
+function field(store: Store, table: string, id: string, column: string) {
+    return store.get<Record<string, unknown>>(`SELECT ${column} FROM ${table} WHERE sync_id = ?`, [id])?.[column];
+}
+
 function room(store: Store, name = "Kitchen") {
     return store.insert("rooms", { scope_id: scope, name });
 }
@@ -86,13 +90,25 @@ test("an unsent insert and its delete cancel out", () => {
     assert.equal(store.all("SELECT * FROM items").length, 0);
 });
 
-test("a cancelled insert takes the new rows in it along", () => {
+test("a cancelled insert takes new rows with a required link to it along", () => {
+    const { store } = setup();
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp" });
+    store.insert("parts", { scope_id: scope, item_id: lamp, name: "Shade" });
+    store.remove("items", lamp);
+    assert.deepEqual(outbox(store), []);
+    assert.equal(store.all("SELECT * FROM parts").length, 0);
+});
+
+test("a cancelled insert clears an optional link to it and keeps the row", () => {
     const { store } = setup();
     const attic = room(store, "Attic");
-    store.insert("items", { scope_id: scope, name: "Lamp", room_id: attic });
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp", room_id: attic });
     store.remove("rooms", attic);
-    assert.deepEqual(outbox(store), []);
-    assert.equal(store.all("SELECT * FROM items").length, 0);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.row_id, entry.payload]),
+        [["items", lamp, { name: "Lamp", room_id: null }]],
+    );
+    assert.equal(field(store, "items", lamp, "room_id"), null);
 });
 
 test("a cancelled insert takes the operations that point at it along", () => {
@@ -109,19 +125,36 @@ test("a cancelled insert takes the operations that point at it along", () => {
 
 test("a cancelled insert keeps a change the server may have seen", () => {
     const { store, db } = setup();
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp" });
+    const shade = store.insert("parts", { scope_id: scope, item_id: lamp, name: "Shade" });
+    db.run("UPDATE sync_outbox SET state = 'sending', attempts = 1 WHERE entity = 'parts'");
+    store.insert("parts", { scope_id: scope, item_id: lamp, name: "Bulb" });
+    store.remove("items", lamp);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.row_id, entry.state, entry.payload]),
+        [[shade, "sending", { item_id: lamp, name: "Shade" }]],
+    );
+    assert.deepEqual(
+        store.all<{ sync_id: string }>("SELECT sync_id FROM parts").map((part) => part.sync_id),
+        [shade],
+    );
+});
+
+test("a cleared optional link leaves a change the server may have seen as it was sent", () => {
+    const { store, db } = setup();
     const attic = room(store, "Attic");
     const lamp = store.insert("items", { scope_id: scope, name: "Lamp", room_id: attic });
     db.run("UPDATE sync_outbox SET state = 'sending', attempts = 1 WHERE entity = 'items'");
-    store.insert("items", { scope_id: scope, name: "Chair", room_id: attic });
+    const chair = store.insert("items", { scope_id: scope, name: "Chair", room_id: attic });
     store.remove("rooms", attic);
     assert.deepEqual(
-        outbox(store).map((entry) => [entry.row_id, entry.state]),
-        [[lamp, "sending"]],
+        outbox(store).map((entry) => [entry.row_id, entry.state, entry.payload]),
+        [
+            [lamp, "sending", { name: "Lamp", room_id: attic }],
+            [chair, "pending", { name: "Chair", room_id: null }],
+        ],
     );
-    assert.deepEqual(
-        store.all<{ sync_id: string }>("SELECT sync_id FROM items").map((item) => item.sync_id),
-        [lamp],
-    );
+    assert.equal(store.all("SELECT * FROM items WHERE room_id IS NOT NULL").length, 0);
 });
 
 test("a delete of a row the server knows leaves the changes in it alone", () => {
@@ -147,7 +180,7 @@ test("a delete of a row the server knows leaves the changes in it alone", () => 
     assert.equal(store.all("SELECT * FROM items").length, 1);
 });
 
-test("a cancelled insert leaves a later upsert of a row that stays, for the server to reject", () => {
+test("a cancelled insert clears an optional link in later upserts of rows that stay", () => {
     const { store } = setup();
     pulled(store, "items", "SOFA", { name: "Sofa" }, 20);
     const lamp = store.insert("items", { scope_id: scope, name: "Lamp" });
@@ -159,11 +192,24 @@ test("a cancelled insert leaves a later upsert of a row that stays, for the serv
         outbox(store).map((entry) => [entry.row_id, entry.payload]),
         [
             [lamp, { name: "Lamp" }],
-            ["SOFA", { room_id: attic, notes: "Torn" }],
-            [lamp, { room_id: attic }],
+            ["SOFA", { room_id: null, notes: "Torn" }],
+            [lamp, { room_id: null }],
         ],
     );
-    assert.equal(store.all("SELECT * FROM items").length, 2);
+    assert.equal(store.all("SELECT * FROM items WHERE room_id IS NULL").length, 2);
+});
+
+test("a cancelled insert leaves a later upsert with a required link, for the server to reject", () => {
+    const { store } = setup();
+    pulled(store, "parts", "SHADE", { item_id: "SOFA", name: "Shade" }, 21);
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp" });
+    store.update("parts", "SHADE", { item_id: lamp });
+    store.remove("items", lamp);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.row_id, entry.payload]),
+        [["SHADE", { item_id: lamp }]],
+    );
+    assert.equal(field(store, "parts", "SHADE", "item_id"), lamp);
 });
 
 test("a cancel follows a chain of new rows and takes back deltas on rows that stay", () => {
@@ -174,11 +220,12 @@ test("a cancel follows a chain of new rows and takes back deltas on rows that st
         tables,
         entities: {
             items: { references: { room_id: "rooms" } },
+            parts: { references: { item_id: "items" } },
             counters: {
                 operations: {
                     adjust: {
                         counters: [{ field: "quantity", delta: "delta" }],
-                        references: { item_id: "items" },
+                        references: { part_id: "parts" },
                     },
                 },
             },
@@ -189,19 +236,20 @@ test("a cancel follows a chain of new rows and takes back deltas on rows that st
         store.get<{ quantity: number }>("SELECT quantity FROM counters WHERE sync_id = 'BULBS'")
             ?.quantity;
     pulled(store, "counters", "BULBS", { name: "Bulbs", quantity: 2 }, 7);
-    const attic = room(store, "Attic");
-    const lamp = store.insert("items", { scope_id: scope, name: "Lamp", room_id: attic });
-    store.operate("counters", "BULBS", "adjust", { item_id: lamp, delta: 3 });
+    // Required links: the shade needs the lamp, and the adjust names the shade.
+    const lamp = store.insert("items", { scope_id: scope, name: "Lamp" });
+    const shade = store.insert("parts", { scope_id: scope, item_id: lamp, name: "Shade" });
+    store.operate("counters", "BULBS", "adjust", { part_id: shade, delta: 3 });
     store.operate("counters", "BULBS", "adjust", { delta: 1 });
     assert.equal(quantity(), 6);
 
-    store.remove("rooms", attic);
+    store.remove("items", lamp);
     assert.equal(quantity(), 3);
     assert.deepEqual(
         outbox(store).map((entry) => [entry.op, entry.payload]),
         [["adjust", { delta: 1 }]],
     );
-    assert.equal(store.all("SELECT * FROM items").length, 0);
+    assert.equal(store.all("SELECT * FROM parts").length, 0);
 });
 
 test("a delete of a row the server knows waits for its ack with the row hidden", () => {

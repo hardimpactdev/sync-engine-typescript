@@ -91,6 +91,13 @@ The scope column is `scope_id` unless you pass `scopeColumn` (for example
 column, such as a child row, passes `scope: (row, db) => ...` in its entity spec
 to say which scope a row belongs to.
 
+Deleting a row the server never saw removes it with its queued changes. Rows
+that point at it follow the reference column, as a foreign key would. A
+nullable column is an optional link: it is set to null, in the row and in its
+unsent changes, and the row stays. A `NOT NULL` column is a required link: a new
+row that it made goes too. Queued operations that point at the deleted row are
+dropped.
+
 ## Sync
 
 The app supplies the transport, so authentication and the base URL stay in the
