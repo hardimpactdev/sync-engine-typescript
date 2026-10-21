@@ -95,8 +95,9 @@ Deleting a row the server never saw removes it with its queued changes. Rows
 that point at it follow the reference column, as a foreign key would. A
 nullable column is an optional link: it is set to null, in the row and in its
 unsent changes, and the row stays. A `NOT NULL` column is a required link: a new
-row that it made goes too. Queued operations that point at the deleted row are
-dropped.
+row that it made goes too. An operation's arguments follow the column of the
+same name in the operation's own table: a nullable one is cleared and the
+operation stays; otherwise the operation is dropped with its deltas.
 
 ## Sync
 
