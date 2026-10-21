@@ -209,3 +209,12 @@ sets that version and publishes it to npm with provenance.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Parallel tests
+
+`npm test` uses Node's stock test runner through `tsx`, with test-file
+concurrency set from `os.availableParallelism()`. Each file runs in its own
+process; test stores and global mocks stay local to it. Node's stock
+`--test-shard=N/M` is available with `node --import tsx --test --test-shard=N/M tests/*.test.ts`; any future shard count belongs only in the CI matrix. The current suite needs no shard matrix.
+For focused local checks, call `tsx --test --test-concurrency=4` with the affected
+files. CI runs all files with the detected CPU allocation.
