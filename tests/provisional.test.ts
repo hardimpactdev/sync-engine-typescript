@@ -1,0 +1,292 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createSyncClient, type SyncTransport } from "../src/client.ts";
+import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
+import { createLocalStore, ProvisionalRowError } from "../src/store.ts";
+import { applyAcks, applyPullPage, takeBatch } from "../src/sync.ts";
+import { memoryDatabase } from "./memory-database.ts";
+import { outbox, pulled, scope, setup, type Store } from "./setup.ts";
+
+// An action the server runs itself: "use" an item, which takes stock and writes a
+// movement on the server. The device sends only the item's change, and shows the
+// result it expects as provisional writes until the server's rows arrive.
+
+const flour = "01JBC59ZQ0B2D4F6H8K0M2P4R6";
+const cake = "01JBC59ZQ0B2D4F6H8K0M2P4R7";
+const serverMovement = "01JBC59ZQ0B2D4F6H8K0M2P4R8";
+
+function kitchen() {
+    const { store, db } = setup();
+    pulled(store, "stock", flour, { name: "Flour", quantity: "5.000" }, 1);
+    pulled(store, "items", cake, { name: "Cake", notes: null }, 2);
+    return { store, db };
+}
+
+/** Uses the cake: the change says so, and the stock and movement are provisional. */
+function bake(store: Store) {
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        {
+            provisional: (local) => {
+                local.insert("movements", { scope_id: scope, stock_id: flour, delta: "-2.000" });
+                local.add("stock", flour, "quantity", "-2.000");
+            },
+        },
+    );
+}
+
+function quantity(store: Store) {
+    return store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [flour])?.quantity;
+}
+
+function movements(store: Store) {
+    return store.all<{ sync_id: string; delta: string }>("SELECT sync_id, delta FROM movements ORDER BY delta");
+}
+
+function provisional(store: Store) {
+    return store.get<{ count: number }>("SELECT COUNT(*) AS count FROM sync_provisional")?.count;
+}
+
+/** The server applied the batch; its own movement and stock come in the same answer. */
+function serverBakes(store: Store, { hasMore = false } = {}) {
+    const [change] = takeBatch(store, scope);
+    applyAcks(store, scope, [{ change_id: change.change_id, status: "applied", seq: 3 }]);
+    applyPullPage(store, scope, {
+        changes: [
+            { entity: "items", id: cake, seq: 3, op: "upsert", row: { name: "Cake", notes: "Baked" } },
+            { entity: "movements", id: serverMovement, seq: 4, op: "upsert", row: { stock_id: flour, delta: "-2.000" } },
+            { entity: "stock", id: flour, seq: 5, op: "upsert", row: { name: "Flour", quantity: "3.000" } },
+        ],
+        cursor: "c5",
+        has_more: hasMore,
+    });
+    return change;
+}
+
+test("a provisional result shows at once and never reaches the outbox", () => {
+    const { store } = kitchen();
+
+    bake(store);
+
+    assert.equal(quantity(store), "3.000");
+    assert.equal(movements(store).length, 1);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.op, entry.payload]),
+        [["items", "upsert", { notes: "Baked" }]],
+    );
+    const [movement] = movements(store);
+    assert.equal(store.isProvisional("movements", movement.sync_id), true);
+    assert.equal(store.isProvisional("items", cake), false);
+});
+
+test("the server's rows replace the provisional result after a drained pull", () => {
+    const { store } = kitchen();
+    bake(store);
+
+    serverBakes(store);
+
+    assert.equal(quantity(store), "3.000");
+    assert.deepEqual(
+        movements(store).map((movement) => movement.sync_id),
+        [serverMovement],
+    );
+    assert.equal(provisional(store), 0);
+});
+
+test("a pulled row keeps the provisional delta until the pull is drained", () => {
+    const { store } = kitchen();
+    bake(store);
+
+    // Another device added flour before this device's change reached the server.
+    pulled(store, "stock", flour, { name: "Flour", quantity: "6.000" }, 3);
+    assert.equal(quantity(store), "4.000");
+
+    // The answer to the change has more pages: the result stays until the last one.
+    serverBakes(store, { hasMore: true });
+    assert.equal(quantity(store), "1.000");
+    assert.equal(movements(store).length, 2);
+
+    applyPullPage(store, scope, { changes: [], cursor: "c6", has_more: false });
+    assert.equal(quantity(store), "3.000");
+    assert.equal(movements(store).length, 1);
+});
+
+test("an action the server already ran counts once", () => {
+    const { store } = kitchen();
+    bake(store);
+
+    // The web baked the cake first. Its rows arrive before this device's change.
+    pulled(store, "stock", flour, { name: "Flour", quantity: "3.000" }, 3);
+    serverBakes(store);
+
+    assert.equal(quantity(store), "3.000");
+    assert.equal(movements(store).length, 1);
+});
+
+test("a rejected change takes its provisional result back", () => {
+    const { store } = kitchen();
+    bake(store);
+
+    const [change] = takeBatch(store, scope);
+    applyAcks(store, scope, [
+        {
+            change_id: change.change_id,
+            status: "rejected",
+            error: { code: "validation", message: "Not today." },
+            current: { name: "Cake", notes: null },
+        },
+    ]);
+
+    assert.equal(quantity(store), "5.000");
+    assert.equal(movements(store).length, 0);
+    assert.equal(provisional(store), 0);
+    assert.equal(store.get<{ notes: string | null }>("SELECT notes FROM items")?.notes, null);
+});
+
+test("dropping an unsent change takes its provisional result back", () => {
+    const { store } = kitchen();
+    bake(store);
+
+    store.remove("items", cake);
+
+    assert.equal(quantity(store), "5.000");
+    assert.equal(movements(store).length, 0);
+    assert.equal(provisional(store), 0);
+});
+
+test("later edits merged into the change keep its provisional result", () => {
+    const { store } = kitchen();
+    bake(store);
+    store.update("items", cake, { name: "Lemon cake" });
+
+    assert.equal(outbox(store).length, 1);
+    serverBakes(store);
+
+    assert.equal(quantity(store), "3.000");
+    assert.equal(provisional(store), 0);
+});
+
+test("a provisional row cannot change or be pointed at", () => {
+    const { store } = kitchen();
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        {
+            provisional: (local) => {
+                local.insert("rooms", { scope_id: scope, name: "Pantry" });
+            },
+        },
+    );
+    const room = store.get<{ sync_id: string }>("SELECT sync_id FROM rooms")!.sync_id;
+
+    assert.throws(() => store.update("rooms", room, { name: "Larder" }), ProvisionalRowError);
+    assert.throws(() => store.remove("rooms", room), ProvisionalRowError);
+    assert.throws(() => store.insert("items", { scope_id: scope, name: "Jar", room_id: room }), ProvisionalRowError);
+    assert.throws(() => store.update("items", cake, { room_id: room }), ProvisionalRowError);
+    assert.equal(outbox(store).length, 1);
+});
+
+test("a provisional result needs a change the server gets", () => {
+    const { store } = kitchen();
+
+    assert.throws(
+        () => store.update("items", cake, { local_photo_path: "a.jpg" }, { provisional: () => {} }),
+        /needs a change/,
+    );
+});
+
+test("a remap moves the provisional delta to the server's row", () => {
+    const { store } = kitchen();
+    const jar = store.insert("stock", { scope_id: scope, name: "Jar" });
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        { provisional: (local) => local.add("stock", jar, "quantity", "-1.000") },
+    );
+    const [first, second] = takeBatch(store, scope);
+    const serverJar = "01JBC59ZQ0B2D4F6H8K0M2P4S0";
+    applyAcks(store, scope, [
+        { change_id: first.change_id, status: "applied", seq: 3, remap: { from: jar, to: serverJar } },
+        { change_id: second.change_id, status: "applied", seq: 4 },
+    ]);
+    const jarStock = () =>
+        store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [serverJar])?.quantity;
+
+    applyPullPage(store, scope, {
+        changes: [{ entity: "stock", id: serverJar, seq: 5, op: "upsert", row: { name: "Jar", quantity: "4.000" } }],
+        cursor: "c5",
+        has_more: true,
+    });
+    assert.equal(jarStock(), "3.000");
+
+    applyPullPage(store, scope, { changes: [], cursor: "c6", has_more: false });
+    assert.equal(jarStock(), "4.000");
+    assert.equal(provisional(store), 0);
+});
+
+test("a sync run settles the result, and a resync keeps a provisional row it has not answered", async () => {
+    const { store } = kitchen();
+    bake(store);
+    let answered = false;
+    const transport: SyncTransport = async (body) => {
+        if (body.changes.length === 0) {
+            return {
+                status: 200,
+                body: { protocol: 1, acks: [], changes: [], cursor: "c9", has_more: false, server_time: "x" },
+            };
+        }
+        answered = true;
+        return {
+            status: 200,
+            body: {
+                protocol: 1,
+                acks: [{ change_id: body.changes[0].change_id, status: "applied", seq: 3 }],
+                changes: [
+                    { entity: "movements", id: serverMovement, seq: 4, op: "upsert", row: { stock_id: flour, delta: "-2.000" } },
+                    { entity: "stock", id: flour, seq: 5, op: "upsert", row: { name: "Flour", quantity: "3.000" } },
+                ],
+                cursor: "c5",
+                has_more: false,
+                server_time: "x",
+            },
+        };
+    };
+    const client = createSyncClient({
+        store,
+        scopeId: scope,
+        clientId: "01JBC4Y0R8T5D8M4QKX3N2V6ZA",
+        entities: ["items", "stock", "movements"],
+        transport,
+    });
+
+    assert.deepEqual(await client.sync(), { status: "synced", pulled: 2, pushed: 1 });
+    assert.equal(answered, true);
+    assert.equal(quantity(store), "3.000");
+    assert.deepEqual(
+        movements(store).map((movement) => movement.sync_id),
+        [serverMovement],
+    );
+});
+
+test("provisional results need the second engine schema", () => {
+    const db = memoryDatabase();
+    migrate(db, [
+        syncEngineSchemaV1,
+        `CREATE TABLE items (sync_id TEXT PRIMARY KEY NOT NULL, scope_id TEXT NOT NULL, server_id INTEGER, server_seq INTEGER,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, name TEXT NOT NULL)`,
+    ]);
+    const store = createLocalStore(db, { tables: ["items"], newId: () => "01JBC59ZQ0B2D4F6H8K0M2P4T0" });
+    db.run("INSERT INTO items (sync_id, scope_id, name, created_at, updated_at) VALUES ('a', ?, 'A', 'x', 'x')", [scope]);
+
+    assert.throws(
+        () => store.update("items", "a", { name: "B" }, { provisional: () => {} }),
+        /syncEngineSchemaV2/,
+    );
+    // Without it, everything else works as before.
+    store.update("items", "a", { name: "B" });
+    assert.equal(store.isProvisional("items", "a"), false);
+});

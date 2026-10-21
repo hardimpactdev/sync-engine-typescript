@@ -26,6 +26,23 @@ export type StoreOptions<T extends string> = {
 export type WriteOptions = {
     /** Local file ids that must upload before this change is sent. */
     dependsOn?: readonly string[];
+    /**
+     * Writes the local, provisional result of an action that the server runs
+     * itself, such as the stock a cook uses. These writes never reach the
+     * outbox. The store keeps them on top of pulled rows until the server's
+     * own result has arrived, then removes them (see the README).
+     */
+    provisional?: (local: ProvisionalWriter) => void;
+};
+
+/** Writes the provisional result of a change. Needs `syncEngineSchemaV2`. */
+export type ProvisionalWriter = {
+    get<R>(sql: string, params?: SqlValue[]): R | null;
+    all<R>(sql: string, params?: SqlValue[]): R[];
+    /** Adds a row that only this device has, and returns its sync_id. Nothing may change it or point at it. */
+    insert(table: string, values: Row): string;
+    /** Adds a delta to a number column of a row, such as a counter. */
+    add(table: string, syncId: string, field: string, delta: SqlValue): void;
 };
 
 /** Writes rows for an operation's local effect. These writes get no outbox entry of their own. */
@@ -59,6 +76,8 @@ export interface LocalStore<T extends string = string> {
         applyLocally?: (local: LocalWriter) => void,
         options?: WriteOptions,
     ): void;
+    /** Whether a row is provisional: made only here, until the server's result replaces it. */
+    isProvisional(table: T, syncId: string): boolean;
     subscribe(tables: readonly (T | EngineTable)[], listener: () => void): () => void;
     /** Changes whenever one of the tables changes, for useSyncExternalStore. */
     version(tables: readonly (T | EngineTable)[]): string;
@@ -85,6 +104,26 @@ export class MissingRowError extends Error {
         this.name = "MissingRowError";
     }
 }
+
+/** A write that would change, or point at, a row the server has not made yet. */
+export class ProvisionalRowError extends Error {
+    constructor(table: string, syncId: string) {
+        super(`The ${table} row ${syncId} is provisional. It waits for the server's own row.`);
+        this.name = "ProvisionalRowError";
+    }
+}
+
+/** One provisional write: a row made only here (field null), or a delta on a field. */
+type ProvisionalEffect = {
+    id: number;
+    change_id: string;
+    scope_id: string;
+    entity: string;
+    row_id: string;
+    field: string | null;
+    delta: SqlValue;
+    acked: number;
+};
 
 /** Columns every synced row has, with the scope column. The store and sync set them; a caller never does. */
 const rowConventions = [
@@ -134,37 +173,45 @@ export function createLocalStore<T extends string>(
         newId: options.newId,
         transaction,
 
-        insert(table, values, { dependsOn } = {}) {
+        insert(table, values, { dependsOn, provisional } = {}) {
             const entity = spec(table);
             const synced = engine.checkWrite(entity, values, "insert");
             const syncId = options.newId();
             const stamp = now();
             const names = ["sync_id", ...Object.keys(values), "created_at", "updated_at"];
             transaction(() => {
+                engine.guardReferences(entity.references, synced);
                 db.run(
                     `INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`,
                     [syncId, ...Object.values(values), stamp, stamp],
                 );
                 const row = engine.row(table, syncId)!;
-                engine.append(entity, row, "upsert", { ...synced }, dependsOn);
+                const entry = engine.append(entity, row, "upsert", { ...synced }, dependsOn);
+                if (provisional) engine.writeProvisional(entry, provisional);
                 touch(table);
             });
             return syncId;
         },
 
-        update(table, syncId, patch, { dependsOn } = {}) {
+        update(table, syncId, patch, { dependsOn, provisional } = {}) {
             const entity = spec(table);
             const synced = engine.checkWrite(entity, patch, "update");
             const columns = Object.keys(patch);
+            if (provisional && Object.keys(synced).length === 0) {
+                throw new Error("A provisional result needs a change that the server gets.");
+            }
             if (columns.length === 0) return;
             transaction(() => {
+                engine.guardRow(table, syncId);
+                engine.guardReferences(entity.references, synced);
                 const { changes } = db.run(
                     `UPDATE ${table} SET ${columns.map((column) => `${column} = ?`).join(", ")}, updated_at = ? WHERE sync_id = ? AND deleted_at IS NULL`,
                     [...Object.values(patch), now(), syncId],
                 );
                 if (changes === 0) throw new MissingRowError(table, syncId);
                 if (Object.keys(synced).length > 0) {
-                    engine.queueUpsert(entity, engine.row(table, syncId)!, synced, dependsOn);
+                    const entry = engine.queueUpsert(entity, engine.row(table, syncId)!, synced, dependsOn);
+                    if (provisional) engine.writeProvisional(entry, provisional);
                 }
                 touch(table);
             });
@@ -175,6 +222,7 @@ export function createLocalStore<T extends string>(
             transaction(() => {
                 const row = engine.row(table, syncId);
                 if (!row || row.deleted_at !== null) throw new MissingRowError(table, syncId);
+                engine.guardRow(table, syncId);
                 const entries = engine.entriesFor(table, syncId);
                 if (!engine.knownToServer(row, entries)) {
                     // An unsent insert and its delete cancel out.
@@ -193,18 +241,24 @@ export function createLocalStore<T extends string>(
             });
         },
 
-        operate(table, rowId, op, args, applyLocally, { dependsOn } = {}) {
+        operate(table, rowId, op, args, applyLocally, { dependsOn, provisional } = {}) {
             const entity = spec(table);
-            if (!entity.operations.has(op)) throw new Error(`${table} has no operation ${op}.`);
+            const operation = entity.operations.get(op);
+            if (!operation) throw new Error(`${table} has no operation ${op}.`);
             transaction(() => {
+                engine.guardReferences(operation.references, args);
                 applyLocally?.(engine.writer);
                 const row = engine.row(table, rowId);
                 if (!row || row.deleted_at !== null) throw new MissingRowError(table, rowId);
+                engine.guardRow(table, rowId);
                 const entry = engine.append(entity, row, op, args, dependsOn);
                 engine.shiftCounters(entry, 1);
+                if (provisional) engine.writeProvisional(entry, provisional);
                 touch(table);
             });
         },
+
+        isProvisional: (table, syncId) => engine.isProvisionalRow(table, syncId),
 
         subscribe(tables, listener) {
             for (const table of tables) {
@@ -409,7 +463,12 @@ function createEngine<T extends string>(
      * Later values win. A merge moves values earlier in the send order, so it
      * does not happen when a new reference points at a row queued after it.
      */
-    function queueUpsert(entity: Spec, values: Row, fields: Row, dependsOn?: readonly string[]) {
+    function queueUpsert(
+        entity: Spec,
+        values: Row,
+        fields: Row,
+        dependsOn?: readonly string[],
+    ): OutboxEntry {
         const entries = entriesFor(entity.name, String(values.sync_id));
         const last = entries.findLast((entry) => entry.op === "upsert");
         const mergeable =
@@ -417,10 +476,7 @@ function createEngine<T extends string>(
             unsent(last) &&
             !entries.some((entry) => entry.position > last.position && entry.op === "delete") &&
             !referencesQueuedAfter(entity, fields, last.position);
-        if (!mergeable) {
-            append(entity, values, "upsert", fields, dependsOn);
-            return;
-        }
+        if (!mergeable) return append(entity, values, "upsert", fields, dependsOn);
         const files = new Set<string>([...parseList(last.depends_on), ...(dependsOn ?? [])]);
         db.run("UPDATE sync_outbox SET payload = ?, depends_on = ? WHERE position = ?", [
             JSON.stringify({ ...JSON.parse(last.payload), ...fields }),
@@ -428,6 +484,7 @@ function createEngine<T extends string>(
             last.position,
         ]);
         touch("sync_outbox");
+        return last;
     }
 
     function referencesQueuedAfter(entity: Spec, fields: Row, position: number): boolean {
@@ -527,13 +584,142 @@ function createEngine<T extends string>(
         }
     }
 
-    /** Removes entries from the outbox and takes back their deltas. */
+    /** Removes entries from the outbox and takes back their deltas and provisional results. */
     function drop(entries: OutboxEntry[]) {
         for (const entry of entries) {
             shiftCounters(entry, -1);
+            settleProvisional(entry.change_id);
             db.run("DELETE FROM sync_outbox WHERE position = ?", [entry.position]);
         }
         if (entries.length > 0) touch("sync_outbox");
+    }
+
+    // Provisional results (syncEngineSchemaV2). A change that the server turns into
+    // more rows, such as a cook that uses stock, can carry the result this device
+    // expects. Those writes have no outbox entry. Pulled rows get the provisional
+    // deltas on top, as they get queued counters. The result goes when the server
+    // has answered: at once for a rejected or dropped change, and for an applied
+    // change at the end of the next drained pull, which holds the server's rows.
+
+    let provisionalReady: boolean | null = null;
+    function hasProvisional(): boolean {
+        provisionalReady ??=
+            db.get("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_provisional'") !== null;
+        return provisionalReady;
+    }
+
+    function writeProvisional(entry: OutboxEntry, work: (local: ProvisionalWriter) => void) {
+        if (!hasProvisional()) {
+            throw new Error("Provisional results need syncEngineSchemaV2 in the app's migrations.");
+        }
+        const record = (entity: string, rowId: string, field: string | null, delta: SqlValue) =>
+            db.run(
+                "INSERT INTO sync_provisional (change_id, scope_id, entity, row_id, field, delta) VALUES (?, ?, ?, ?, ?, ?)",
+                [entry.change_id, entry.scope_id, entity, rowId, field, delta],
+            );
+        work({
+            get: (sql, params = []) => db.get(sql, params),
+            all: (sql, params = []) => db.all(sql, params),
+            insert(table, values) {
+                spec(table);
+                for (const column of Object.keys(values)) {
+                    if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
+                    if (conventions.has(column) && column !== scopeColumn) {
+                        throw new Error(`The store sets ${column} itself.`);
+                    }
+                }
+                const syncId = newId();
+                const stamp = now();
+                const names = ["sync_id", ...Object.keys(values), "created_at", "updated_at"];
+                db.run(
+                    `INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`,
+                    [syncId, ...Object.values(values), stamp, stamp],
+                );
+                record(table, syncId, null, null);
+                touch(table);
+                return syncId;
+            },
+            add(table, syncId, field, delta) {
+                spec(table);
+                if (!plainName.test(field) || !columns(table).has(field)) {
+                    throw new Error(`${table}.${field} is not a column.`);
+                }
+                const current = row(table, syncId);
+                if (!current || current.deleted_at !== null) throw new MissingRowError(table, syncId);
+                db.run(`UPDATE ${table} SET ${field} = ? WHERE sync_id = ?`, [
+                    addValues(current[field], delta),
+                    syncId,
+                ]);
+                record(table, syncId, field, delta);
+                touch(table);
+            },
+        });
+    }
+
+    function provisionalOn(entity: string, rowId: string): ProvisionalEffect[] {
+        if (!hasProvisional()) return [];
+        return db.all<ProvisionalEffect>(
+            "SELECT * FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NOT NULL ORDER BY id",
+            [entity, rowId],
+        );
+    }
+
+    function isProvisionalRow(entity: string, rowId: string): boolean {
+        if (!hasProvisional()) return false;
+        return (
+            db.get(
+                "SELECT 1 FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NULL",
+                [entity, rowId],
+            ) !== null
+        );
+    }
+
+    /** Refuses a write to a provisional row: the server's own row replaces it. */
+    function guardRow(entity: string, rowId: string) {
+        if (isProvisionalRow(entity, rowId)) throw new ProvisionalRowError(entity, rowId);
+    }
+
+    /** Refuses a reference to a provisional row: the server would not know it. */
+    function guardReferences(references: Map<string, string>, values: Row) {
+        for (const [field, target] of references) {
+            const value = values[field];
+            if (typeof value === "string") guardRow(target, value);
+        }
+    }
+
+    /** Removes provisional results: of one change, or of the changes the server applied in a scope. */
+    function settleProvisional(changeId: string): void;
+    function settleProvisional(changeId: null, scopeId: string): void;
+    function settleProvisional(changeId: string | null, scopeId?: string) {
+        if (!hasProvisional()) return;
+        const effects =
+            changeId !== null
+                ? db.all<ProvisionalEffect>("SELECT * FROM sync_provisional WHERE change_id = ? ORDER BY id DESC", [
+                      changeId,
+                  ])
+                : db.all<ProvisionalEffect>(
+                      "SELECT * FROM sync_provisional WHERE scope_id = ? AND acked = 1 ORDER BY id DESC",
+                      [scopeId!],
+                  );
+        for (const effect of effects) {
+            db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
+            const current = row(effect.entity, effect.row_id);
+            if (!current) continue;
+            if (effect.field === null) {
+                deleteRow(effect.entity, effect.row_id);
+                continue;
+            }
+            db.run(`UPDATE ${effect.entity} SET ${effect.field} = ? WHERE sync_id = ?`, [
+                addValues(current[effect.field], negate(effect.delta)),
+                effect.row_id,
+            ]);
+            touch(effect.entity);
+        }
+    }
+
+    /** The server applied the change: its result arrives with the next drained pull. */
+    function ackProvisional(changeId: string) {
+        if (hasProvisional()) db.run("UPDATE sync_provisional SET acked = 1 WHERE change_id = ?", [changeId]);
     }
 
     /**
@@ -673,6 +859,9 @@ function createEngine<T extends string>(
         for (const hit of countersLandingOn(entity, syncId)) {
             if (hit.field in values) values[hit.field] = addValues(values[hit.field], hit.delta);
         }
+        for (const effect of provisionalOn(entity, syncId)) {
+            if (effect.field! in values) values[effect.field!] = addValues(values[effect.field!], effect.delta);
+        }
         if (seq !== undefined) values.server_seq = seq;
         const stamp = now();
         values.updated_at ??= stamp;
@@ -740,6 +929,10 @@ function createEngine<T extends string>(
         }
         for (const table of ["sync_outbox", "sync_rejected", "sync_state"]) {
             db.run(`UPDATE OR IGNORE ${table} SET scope_id = ? WHERE scope_id = ?`, [to, from]);
+        }
+        if (hasProvisional()) {
+            db.run("UPDATE sync_provisional SET scope_id = ? WHERE scope_id = ?", [to, from]);
+            db.run("UPDATE sync_provisional SET row_id = ? WHERE entity = ? AND row_id = ?", [to, entity, from]);
         }
         db.run("UPDATE sync_rejected SET row_id = ? WHERE entity = ? AND row_id = ?", [
             to,
@@ -827,6 +1020,13 @@ function createEngine<T extends string>(
         cancel,
         rebaseRow,
         remap,
+        hasProvisional,
+        writeProvisional,
+        isProvisionalRow,
+        guardRow,
+        guardReferences,
+        settleProvisional,
+        ackProvisional,
     };
 }
 

@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
+import { migrate, syncEngineSchemaV1, syncEngineSchemaV2 } from "../src/migrate.ts";
 import { createLocalStore } from "../src/store.ts";
 import { applyPullPage } from "../src/sync.ts";
 import type { Row } from "../src/database.ts";
@@ -42,6 +42,7 @@ export const testMigrations = [
     CREATE TABLE movements (${row}, stock_id TEXT, delta TEXT NOT NULL);
     CREATE TABLE parts (${row}, item_id TEXT NOT NULL, name TEXT NOT NULL);
     `,
+    syncEngineSchemaV2,
 ];
 
 export const tables = ["scopes", "rooms", "items", "counters", "stock", "movements", "parts"] as const;

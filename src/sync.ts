@@ -96,6 +96,8 @@ export type AckResult = {
  * leave the outbox; a remap moves every reference to the server's row. A
  * rejected change moves to `sync_rejected` with its values, and its row is
  * restored from the server's `current` with the other queued changes on top.
+ * A rejected change's provisional result goes at once. An applied change's
+ * result stays until the next drained pull brings the server's rows.
  */
 export function applyAcks(store: LocalStore, scopeId: string, acks: Ack[]): AckResult {
     const engine = engineOf(store);
@@ -113,6 +115,7 @@ export function applyAcks(store: LocalStore, scopeId: string, acks: Ack[]): AckR
                 continue;
             }
             engine.db.run("DELETE FROM sync_outbox WHERE position = ?", [entry.position]);
+            engine.ackProvisional(entry.change_id);
             const row = engine.row(entry.entity, entry.row_id);
             if (entry.op === "delete") {
                 if (row && row.deleted_at !== null) engine.deleteRow(entry.entity, entry.row_id);
@@ -189,6 +192,8 @@ function keep(
         ],
     );
     engine.db.run("DELETE FROM sync_outbox WHERE position = ?", [entry.position]);
+    // The server will not run this change, so its provisional result goes.
+    engine.settleProvisional(entry.change_id);
     engine.touch("sync_rejected");
     return {
         change_id: entry.change_id,
@@ -210,6 +215,8 @@ export type PullResult = {
  * Pulled rows keep the fields of queued upserts, counters get queued deltas on
  * top, and rows with a queued delete stay hidden. A tombstone deletes the row
  * and drops its unsent changes. Entities this app does not know are skipped.
+ * The last page of a pull (`has_more: false`) holds what the server made of
+ * the changes it applied, so their provisional results go then.
  */
 export function applyPullPage(store: LocalStore, scopeId: string, page: PullPage): PullResult {
     const engine = engineOf(store);
@@ -244,6 +251,7 @@ export function applyPullPage(store: LocalStore, scopeId: string, page: PullPage
             [scopeId, page.cursor, page.has_more ? 0 : 1, engine.now()],
         );
         engine.touch("sync_state");
+        if (!page.has_more) engine.settleProvisional(null, scopeId);
         // The cursor is opaque, so keep the highest seq apart. A poke compares to it.
         const seq = Math.max(...page.changes.map((change) => change.seq));
         if (seq > (pulledSeqOf(store, scopeId) ?? 0)) {

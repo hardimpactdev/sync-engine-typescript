@@ -221,6 +221,7 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
                     const id = row.sync_id as string;
                     if (seen.has(`${table}:${id}`)) continue;
                     if (engine.entriesFor(table, id).length) continue;
+                    if (engine.isProvisionalRow(table, id)) continue;
                     engine.deleteRow(table, id);
                 }
             }
@@ -245,6 +246,9 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
             engine.db.run("DELETE FROM sync_outbox WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM sync_rejected WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM sync_state WHERE scope_id = ?", [scopeId]);
+            if (engine.hasProvisional()) {
+                engine.db.run("DELETE FROM sync_provisional WHERE scope_id = ?", [scopeId]);
+            }
             engine.db.run("DELETE FROM local_meta WHERE key = ?", [pulledSeqKey(scopeId)]);
             setResync(false);
             for (const table of ["sync_outbox", "sync_rejected", "sync_state"]) engine.touch(table);

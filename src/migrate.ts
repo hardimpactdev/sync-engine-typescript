@@ -96,3 +96,28 @@ export const syncEngineSchemaV1 = `
     );
     CREATE INDEX IF NOT EXISTS sync_rejected_row ON sync_rejected (entity, row_id);
 `;
+
+/**
+ * The engine's tables added in 0.1.9: provisional results. Add it as a later
+ * step than `syncEngineSchemaV1`. It only creates what is missing.
+ *
+ * `sync_provisional` holds what a change wrote only on this device: a row
+ * (`field` null) or a delta on a field. `acked` is 1 once the server applied
+ * the change. An app may read it, for example to leave provisional rows out of
+ * a picker; only the store writes it.
+ */
+export const syncEngineSchemaV2 = `
+    CREATE TABLE IF NOT EXISTS sync_provisional (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        change_id TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        entity TEXT NOT NULL,
+        row_id TEXT NOT NULL,
+        field TEXT,
+        delta TEXT,
+        acked INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS sync_provisional_change ON sync_provisional (change_id);
+    CREATE INDEX IF NOT EXISTS sync_provisional_row ON sync_provisional (entity, row_id);
+    CREATE INDEX IF NOT EXISTS sync_provisional_scope ON sync_provisional (scope_id, acked);
+`;
