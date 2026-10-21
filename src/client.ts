@@ -5,6 +5,7 @@ import {
     applyAcks,
     applyPullPage,
     cursorOf,
+    pulledSeqKey,
     returnToPending,
     takeBatch,
     type RejectedChange,
@@ -244,6 +245,7 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
             engine.db.run("DELETE FROM sync_outbox WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM sync_rejected WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM sync_state WHERE scope_id = ?", [scopeId]);
+            engine.db.run("DELETE FROM local_meta WHERE key = ?", [pulledSeqKey(scopeId)]);
             setResync(false);
             for (const table of ["sync_outbox", "sync_rejected", "sync_state"]) engine.touch(table);
             return lost;

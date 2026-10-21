@@ -6,6 +6,7 @@ import {
     applyAcks,
     applyPullPage,
     cursorOf,
+    pulledSeqOf,
     returnToPending,
     takeBatch,
 } from "../src/sync.ts";
@@ -370,6 +371,24 @@ test("a page and its cursor land together or not at all", () => {
     );
     assert.equal(cursorOf(store, scope), "c1");
     assert.equal(row(store, "rooms", hall), null);
+});
+
+test("a pull keeps the highest seq it has brought, which never goes down", () => {
+    const { store } = setup();
+    assert.equal(pulledSeqOf(store, scope), null);
+    applyPullPage(store, scope, {
+        changes: [
+            { entity: "rooms", id: hall, seq: 3, op: "upsert", row: { name: "Hall" } },
+            { entity: "unknown", id: kitchen, seq: 7, op: "delete" },
+        ],
+        cursor: "c7",
+        has_more: false,
+    });
+    assert.equal(pulledSeqOf(store, scope), 7, "a change this app skips still counts");
+
+    applyPullPage(store, scope, { changes: [], cursor: "c7", has_more: false });
+    pulled(store, "rooms", hall, { name: "Hall" }, 5);
+    assert.equal(pulledSeqOf(store, scope), 7);
 });
 
 test("a batch holds at most 100 changes in outbox order", () => {

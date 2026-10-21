@@ -9,7 +9,7 @@ import {
 import { migrate, syncEngineSchemaV1 } from "../src/migrate.ts";
 import { createSyncScheduler } from "../src/scheduler.ts";
 import { createLocalStore } from "../src/store.ts";
-import { cursorOf } from "../src/sync.ts";
+import { cursorOf, pulledSeqOf } from "../src/sync.ts";
 import { memoryDatabase } from "./memory-database.ts";
 import { scope, outbox, pulled, setup, type Store } from "./setup.ts";
 
@@ -131,6 +131,7 @@ test("a scope the user lost is purged, and the lost changes are counted", async 
     assert.deepEqual(names(store), []);
     assert.deepEqual(outbox(store), []);
     assert.equal(cursorOf(store, scope), null);
+    assert.equal(pulledSeqOf(store, scope), null);
 });
 
 test("a purge also takes child rows that find their scope through a parent", async () => {
