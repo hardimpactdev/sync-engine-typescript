@@ -132,8 +132,10 @@ change:
   both until the last page.
 - **Rejected,** or dropped before it was sent: at once.
 
-A provisional row is read-only. A write to it, or a reference to it, throws a
-`ProvisionalRowError`; `store.isProvisional(table, id)` tells the app before.
+A provisional row is read-only. A write to it, a delta on it, a reference to it
+or a row in it as a scope throws a `ProvisionalRowError`;
+`store.isProvisional(table, id)` tells the app before. Removing a row that was
+never sent takes the provisional rows that need it along.
 This needs `syncEngineSchemaV2`, a later migration step than
 `syncEngineSchemaV1`. It adds the `sync_provisional` table.
 

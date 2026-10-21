@@ -181,6 +181,7 @@ export function createLocalStore<T extends string>(
             const names = ["sync_id", ...Object.keys(values), "created_at", "updated_at"];
             transaction(() => {
                 engine.guardReferences(entity.references, synced);
+                engine.guardScope(values[engine.scopeColumn]);
                 db.run(
                     `INSERT INTO ${table} (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`,
                     [syncId, ...Object.values(values), stamp, stamp],
@@ -646,6 +647,7 @@ function createEngine<T extends string>(
                 }
                 const current = row(table, syncId);
                 if (!current || current.deleted_at !== null) throw new MissingRowError(table, syncId);
+                guardRow(table, syncId);
                 db.run(`UPDATE ${table} SET ${field} = ? WHERE sync_id = ?`, [
                     addValues(current[field], delta),
                     syncId,
@@ -687,6 +689,16 @@ function createEngine<T extends string>(
         }
     }
 
+    /** Refuses a row in a provisional scope. */
+    function guardScope(scopeId: unknown) {
+        if (typeof scopeId !== "string" || !hasProvisional()) return;
+        const found = db.get<{ entity: string }>(
+            "SELECT entity FROM sync_provisional WHERE row_id = ? AND field IS NULL",
+            [scopeId],
+        );
+        if (found) throw new ProvisionalRowError(found.entity, scopeId);
+    }
+
     /** Removes provisional results: of one change, or of the changes the server applied in a scope. */
     function settleProvisional(changeId: string): void;
     function settleProvisional(changeId: null, scopeId: string): void;
@@ -698,8 +710,8 @@ function createEngine<T extends string>(
                       changeId,
                   ])
                 : db.all<ProvisionalEffect>(
-                      "SELECT * FROM sync_provisional WHERE scope_id = ? AND acked = 1 ORDER BY id DESC",
-                      [scopeId!],
+                      "SELECT * FROM sync_provisional WHERE scope_id IN (?, ?) AND acked = 1 ORDER BY id DESC",
+                      [scopeId!, scopeAlias(scopeId!)],
                   );
         for (const effect of effects) {
             db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
@@ -715,6 +727,15 @@ function createEngine<T extends string>(
             ]);
             touch(effect.entity);
         }
+    }
+
+    /** The scope a remapped scope became, so a client that still uses the old id settles its results. */
+    function scopeAlias(scopeId: string): string {
+        return (
+            db.get<{ value: string }>("SELECT value FROM local_meta WHERE key = ?", [
+                `sync.provisional_scope.${scopeId}`,
+            ])?.value ?? scopeId
+        );
     }
 
     /** The server applied the change: its result arrives with the next drained pull. */
@@ -741,6 +762,7 @@ function createEngine<T extends string>(
         drop(entriesFor(entity, rowId));
         deleteRow(entity, rowId);
         clearLinks(entity, rowId);
+        cancelProvisionalChildren(entity, rowId);
         const key = `${entity}:${rowId}`;
         const mentions = db.all<OutboxEntry>(
             "SELECT * FROM sync_outbox WHERE state = 'pending' AND attempts = 0 AND instr(payload, ?) > 0 ORDER BY position",
@@ -761,6 +783,33 @@ function createEngine<T extends string>(
                 continue;
             }
             if (entry.op !== "upsert") drop([entry]);
+        }
+    }
+
+    /**
+     * A provisional row with a required link to a cancelled row goes with it, as a queued
+     * child would; an optional link was cleared by clearLinks. Deltas on the cancelled row
+     * have nothing left to land on, so their records go too.
+     */
+    function cancelProvisionalChildren(entity: string, rowId: string) {
+        if (!hasProvisional()) return;
+        db.run("DELETE FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NOT NULL", [
+            entity,
+            rowId,
+        ]);
+        for (const effect of db.all<ProvisionalEffect>(
+            "SELECT * FROM sync_provisional WHERE field IS NULL ORDER BY id",
+        )) {
+            const source = specs.get(effect.entity);
+            const child = row(effect.entity, effect.row_id);
+            if (!source || !child) continue;
+            for (const [field, pointsAt] of source.references) {
+                if (pointsAt !== entity || child[field] !== rowId || optional(effect.entity, field)) continue;
+                db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
+                deleteRow(effect.entity, effect.row_id);
+                cancelProvisionalChildren(effect.entity, effect.row_id);
+                break;
+            }
         }
     }
 
@@ -896,6 +945,14 @@ function createEngine<T extends string>(
         if (from === to) return;
         const target = row(entity, to);
         if (target) {
+            // The row this one becomes gets its provisional deltas, which move with the records below.
+            for (const effect of provisionalOn(entity, from)) {
+                const current = row(entity, to)!;
+                db.run(`UPDATE ${entity} SET ${effect.field} = ? WHERE sync_id = ?`, [
+                    addValues(current[effect.field!], effect.delta),
+                    to,
+                ]);
+            }
             for (const column of columns(entity)) {
                 if (!column.startsWith("local_")) continue;
                 db.run(
@@ -931,7 +988,13 @@ function createEngine<T extends string>(
             db.run(`UPDATE OR IGNORE ${table} SET scope_id = ? WHERE scope_id = ?`, [to, from]);
         }
         if (hasProvisional()) {
-            db.run("UPDATE sync_provisional SET scope_id = ? WHERE scope_id = ?", [to, from]);
+            const { changes } = db.run("UPDATE sync_provisional SET scope_id = ? WHERE scope_id = ?", [to, from]);
+            if (changes > 0) {
+                db.run(
+                    "INSERT INTO local_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    [`sync.provisional_scope.${from}`, to],
+                );
+            }
             db.run("UPDATE sync_provisional SET row_id = ? WHERE entity = ? AND row_id = ?", [to, entity, from]);
         }
         db.run("UPDATE sync_rejected SET row_id = ? WHERE entity = ? AND row_id = ?", [
@@ -970,6 +1033,7 @@ function createEngine<T extends string>(
         all: (sql, params = []) => db.all(sql, params),
         put(table, syncId, values) {
             spec(table);
+            guardRow(table, syncId);
             for (const column of Object.keys(values)) {
                 if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
                 if (conventions.has(column) && column !== scopeColumn) {
@@ -1025,6 +1089,7 @@ function createEngine<T extends string>(
         isProvisionalRow,
         guardRow,
         guardReferences,
+        guardScope,
         settleProvisional,
         ackProvisional,
     };

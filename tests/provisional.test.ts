@@ -290,3 +290,98 @@ test("provisional results need the second engine schema", () => {
     store.update("items", "a", { name: "B" });
     assert.equal(store.isProvisional("items", "a"), false);
 });
+
+test("a remap onto a row this device has keeps the provisional delta on that row", () => {
+    const { store } = kitchen();
+    const server = "01JBC59ZQ0B2D4F6H8K0M2P4S1";
+    pulled(store, "stock", server, { name: "Sugar", quantity: "5.000" }, 3);
+    const sugar = store.insert("stock", { scope_id: scope, name: "Sugar" });
+    store.update("items", cake, { notes: "Baked" }, { provisional: (local) => local.add("stock", sugar, "quantity", "-2.000") });
+    const [create, use] = takeBatch(store, scope);
+    const sugarStock = () => store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [server])?.quantity;
+
+    applyAcks(store, scope, [{ change_id: create.change_id, status: "applied", seq: 4, remap: { from: sugar, to: server } }]);
+    assert.equal(sugarStock(), "3.000");
+
+    applyAcks(store, scope, [
+        { change_id: use.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null } },
+    ]);
+    assert.equal(sugarStock(), "5.000");
+    applyPullPage(store, scope, { changes: [], cursor: "c9", has_more: false });
+    assert.equal(sugarStock(), "5.000");
+});
+
+test("a remapped scope still settles its results when the client uses the old id", () => {
+    const { store } = setup();
+    const guest = store.insert("scopes", { name: "Guest" });
+    const cakeId = store.insert(
+        "items",
+        { scope_id: guest, name: "Cake" },
+        { provisional: (local) => local.insert("rooms", { scope_id: guest, name: "Provisional pantry" }) },
+    );
+    const [create, bake] = takeBatch(store, guest);
+    applyAcks(store, guest, [
+        { change_id: create.change_id, status: "applied", seq: 1, remap: { from: guest, to: scope } },
+        { change_id: bake.change_id, status: "applied", seq: 2 },
+    ]);
+    applyPullPage(store, guest, {
+        changes: [{ entity: "items", id: cakeId, seq: 2, op: "upsert", row: { name: "Cake" } }],
+        cursor: "c2",
+        has_more: false,
+    });
+
+    assert.equal(provisional(store), 0);
+    assert.equal(store.get("SELECT 1 FROM rooms"), null);
+});
+
+test("a cancelled row takes the provisional rows that need it", () => {
+    const { store } = kitchen();
+    const jar = store.insert("items", { scope_id: scope, name: "Jar" });
+    let part = "";
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        {
+            provisional: (local) => {
+                part = local.insert("parts", { scope_id: scope, item_id: jar, name: "Lid" });
+            },
+        },
+    );
+
+    store.remove("items", jar);
+
+    assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [part]), null);
+    assert.equal(provisional(store), 0);
+    assert.equal(outbox(store).length, 1);
+});
+
+test("no write path changes or points into a provisional row", () => {
+    const { store } = kitchen();
+    pulled(store, "counters", "01JBC59ZQ0B2D4F6H8K0M2P4S2", { name: "Bakes", quantity: 0 }, 3);
+    let stock = "";
+    let room = "";
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        {
+            provisional: (local) => {
+                stock = local.insert("stock", { scope_id: scope, name: "Butter", quantity: "5.000" });
+                room = local.insert("scopes", { name: "Provisional scope" });
+            },
+        },
+    );
+    const bakes = "01JBC59ZQ0B2D4F6H8K0M2P4S2";
+
+    assert.throws(
+        () => store.operate("counters", bakes, "adjust", { delta: 1 }, (local) => local.put("stock", stock, { name: "Ghee" })),
+        ProvisionalRowError,
+    );
+    assert.throws(
+        () => store.operate("counters", bakes, "adjust", { delta: 1 }, undefined, { provisional: (local) => local.add("stock", stock, "quantity", "-1.000") }),
+        ProvisionalRowError,
+    );
+    assert.throws(() => store.insert("rooms", { scope_id: room, name: "Hall" }), ProvisionalRowError);
+    assert.equal(outbox(store).length, 1);
+});
