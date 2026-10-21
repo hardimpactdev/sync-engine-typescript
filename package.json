@@ -36,7 +36,7 @@
     ],
     "scripts": {
         "build": "node scripts/build.mjs",
-        "test": "tsx --test tests/*.test.ts",
+        "test": "tsx --test --test-concurrency=$(node -p 'require(\"node:os\").availableParallelism()') tests/*.test.ts",
         "typecheck": "tsc --noEmit",
         "prepublishOnly": "npm run typecheck && npm test && npm run build"
     },
