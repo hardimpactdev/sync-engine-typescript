@@ -130,7 +130,11 @@ change:
 - **Applied:** at the end of the next pull with `has_more: false`, which holds
   the server's own rows. During a pull of several pages, a pulled row can show
   both until the last page.
-- **Rejected,** or dropped before it was sent: at once.
+- **Rejected,** or dropped by a pulled tombstone or a cancelled parent: at once.
+
+Removing a row keeps its unsent action, also when the server never saw the
+row: the action, with the changes it builds on, goes before the delete, so the
+server runs it once and nothing is taken back or counted twice.
 
 A provisional row is read-only. A write to it, a delta on it, a reference to it
 or a row in it as a scope throws a `ProvisionalRowError`;
