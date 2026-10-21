@@ -18,7 +18,7 @@ jobs:
             - uses: actions/setup-node@v5
               with:
                   # Trusted Publishing needs npm 11.5.1 or later.
-                  node-version: '24'
+                  node-version-file: ".node-version"
                   registry-url: 'https://registry.npmjs.org'
             - run: npm ci
             - run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
