@@ -385,3 +385,81 @@ test("no write path changes or points into a provisional row", () => {
     assert.throws(() => store.insert("rooms", { scope_id: room, name: "Hall" }), ProvisionalRowError);
     assert.equal(outbox(store).length, 1);
 });
+
+test("provisional rows that point at a provisional row follow it when it goes", () => {
+    const { store } = kitchen();
+    let room = "";
+    let jar = "";
+    let lid = "";
+    let hall = "";
+    // One change makes a room, an item and a scope; a later change points at them.
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        {
+            provisional: (local) => {
+                room = local.insert("rooms", { scope_id: scope, name: "Pantry" });
+                jar = local.insert("items", { scope_id: scope, name: "Jar" });
+            },
+        },
+    );
+    const extra = store.insert("counters", { scope_id: scope, name: "Bakes" });
+    store.update(
+        "counters",
+        extra,
+        { name: "Bakes today" },
+        {
+            provisional: (local) => {
+                const shelf = local.insert("scopes", { name: "Shelf" });
+                hall = local.insert("items", { scope_id: scope, name: "Tin", room_id: room });
+                lid = local.insert("parts", { scope_id: scope, item_id: jar, name: "Lid" });
+                local.insert("rooms", { scope_id: shelf, name: "On the shelf" });
+            },
+        },
+    );
+
+    const [bake] = takeBatch(store, scope);
+    applyAcks(store, scope, [
+        { change_id: bake.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null } },
+    ]);
+
+    // An optional link is cleared, a required one takes the row along.
+    assert.equal(store.get<{ room_id: string | null }>("SELECT room_id FROM items WHERE sync_id = ?", [hall])?.room_id, null);
+    assert.equal(store.get("SELECT 1 FROM parts WHERE sync_id = ?", [lid]), null);
+    assert.equal(store.get("SELECT 1 FROM items WHERE sync_id = ?", [jar]), null);
+});
+
+test("an operation's local effect cannot point into a provisional row", () => {
+    const { store } = kitchen();
+    pulled(store, "counters", "01JBC59ZQ0B2D4F6H8K0M2P4S3", { name: "Bakes", quantity: 0 }, 3);
+    let room = "";
+    let shelf = "";
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        {
+            provisional: (local) => {
+                room = local.insert("rooms", { scope_id: scope, name: "Pantry" });
+                shelf = local.insert("scopes", { name: "Shelf" });
+            },
+        },
+    );
+    const bakes = "01JBC59ZQ0B2D4F6H8K0M2P4S3";
+
+    assert.throws(
+        () =>
+            store.operate("counters", bakes, "adjust", { delta: 1 }, (local) =>
+                local.put("items", "01JBC59ZQ0B2D4F6H8K0M2P4S4", { scope_id: scope, name: "Tin", room_id: room }),
+            ),
+        ProvisionalRowError,
+    );
+    assert.throws(
+        () =>
+            store.operate("counters", bakes, "adjust", { delta: 1 }, (local) =>
+                local.put("rooms", "01JBC59ZQ0B2D4F6H8K0M2P4S5", { scope_id: shelf, name: "Hall" }),
+            ),
+        ProvisionalRowError,
+    );
+});

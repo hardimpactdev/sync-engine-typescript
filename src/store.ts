@@ -46,7 +46,10 @@ export type WriteOptions = {
 export type ProvisionalWriter = {
     get<R>(sql: string, params?: SqlValue[]): R | null;
     all<R>(sql: string, params?: SqlValue[]): R[];
-    /** Adds a row that only this device has, and returns its sync_id. Nothing may change it or point at it. */
+    /**
+     * Adds a row that only this device has, and returns its sync_id. Only other provisional
+     * rows may point at it; they follow it when it goes, as through a foreign key.
+     */
     insert(table: string, values: Row): string;
     /** Adds a delta to a number column of a row, such as a counter. */
     add(table: string, syncId: string, field: string, delta: SqlValue): void;
@@ -735,6 +738,7 @@ function createEngine<T extends string>(
             if (!current) continue;
             if (effect.field === null) {
                 deleteRow(effect.entity, effect.row_id);
+                releaseProvisionalChildren(effect.entity, effect.row_id);
                 continue;
             }
             db.run(`UPDATE ${effect.entity} SET ${effect.field} = ? WHERE sync_id = ?`, [
@@ -778,7 +782,7 @@ function createEngine<T extends string>(
         drop(entriesFor(entity, rowId));
         deleteRow(entity, rowId);
         clearLinks(entity, rowId);
-        cancelProvisionalChildren(entity, rowId);
+        releaseProvisionalChildren(entity, rowId);
         const key = `${entity}:${rowId}`;
         const mentions = db.all<OutboxEntry>(
             "SELECT * FROM sync_outbox WHERE state = 'pending' AND attempts = 0 AND instr(payload, ?) > 0 ORDER BY position",
@@ -803,11 +807,12 @@ function createEngine<T extends string>(
     }
 
     /**
-     * A provisional row with a required link to a cancelled row goes with it, as a queued
-     * child would; an optional link was cleared by clearLinks. Deltas on the cancelled row
-     * have nothing left to land on, so their records go too.
+     * What happens to provisional rows when a row they point at goes: a cancelled row, or
+     * a provisional row whose change settled. As a foreign key would, an optional link is
+     * cleared and a required link takes the provisional row along; a row in a scope that
+     * goes, goes too. Deltas on the row that went have nothing left to land on.
      */
-    function cancelProvisionalChildren(entity: string, rowId: string) {
+    function releaseProvisionalChildren(entity: string, rowId: string) {
         if (!hasProvisional()) return;
         db.run("DELETE FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NOT NULL", [
             entity,
@@ -819,13 +824,20 @@ function createEngine<T extends string>(
             const source = specs.get(effect.entity);
             const child = row(effect.entity, effect.row_id);
             if (!source || !child) continue;
+            let goes = child[scopeColumn] === rowId;
             for (const [field, pointsAt] of source.references) {
-                if (pointsAt !== entity || child[field] !== rowId || optional(effect.entity, field)) continue;
-                db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
-                deleteRow(effect.entity, effect.row_id);
-                cancelProvisionalChildren(effect.entity, effect.row_id);
-                break;
+                if (goes || pointsAt !== entity || child[field] !== rowId) continue;
+                if (optional(effect.entity, field)) {
+                    db.run(`UPDATE ${effect.entity} SET ${field} = NULL WHERE sync_id = ?`, [effect.row_id]);
+                    touch(effect.entity);
+                } else {
+                    goes = true;
+                }
             }
+            if (!goes) continue;
+            db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
+            deleteRow(effect.entity, effect.row_id);
+            releaseProvisionalChildren(effect.entity, effect.row_id);
         }
     }
 
@@ -1048,8 +1060,10 @@ function createEngine<T extends string>(
         get: (sql, params = []) => db.get(sql, params),
         all: (sql, params = []) => db.all(sql, params),
         put(table, syncId, values) {
-            spec(table);
+            const entity = spec(table);
             guardRow(table, syncId);
+            guardReferences(entity.references, values);
+            guardScope(values[scopeColumn]);
             for (const column of Object.keys(values)) {
                 if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
                 if (conventions.has(column) && column !== scopeColumn) {
