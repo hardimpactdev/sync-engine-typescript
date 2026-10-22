@@ -255,6 +255,7 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
             engine.db.run("DELETE FROM sync_rejected WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM sync_state WHERE scope_id = ?", [scopeId]);
             engine.db.run("DELETE FROM local_meta WHERE key = ?", [pulledSeqKey(scopeId)]);
+            engine.noteFeatures(scopeId, null);
             setResync(false);
             for (const table of ["sync_outbox", "sync_rejected", "sync_state"]) engine.touch(table);
             return lost;

@@ -753,12 +753,17 @@ function createEngine<T extends string>(
         );
     }
 
-    /** Records what the server supports, from each answer (protocol §5.5). */
-    function noteFeatures(scopeId: string, features: readonly string[] | undefined) {
+    /** Records what the server supports, from each answer (protocol §5.5); null forgets it. */
+    function noteFeatures(scopeId: string, features: readonly string[] | null | undefined) {
         if (!hasProposals()) return;
+        const key = `sync.proposals.${scopeId}`;
+        if (features === null) {
+            db.run("DELETE FROM local_meta WHERE key = ?", [key]);
+            return;
+        }
         db.run(
             "INSERT INTO local_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            [`sync.proposals.${scopeId}`, features?.includes("proposals") ? "1" : "0"],
+            [key, features?.includes("proposals") ? "1" : "0"],
         );
     }
 
