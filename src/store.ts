@@ -51,7 +51,11 @@ export type ProvisionalWriter = {
      * rows may point at it; they follow it when it goes, as through a foreign key.
      */
     insert(table: string, values: Row): string;
-    /** Adds a delta to a counter: a field that an operation's counters change, such as stock. */
+    /**
+     * Adds a delta to a counter: a field that an operation's counters change, such as stock.
+     * The row may be provisional itself, made by an earlier change: the delta builds on that
+     * result, and goes when the row goes.
+     */
     add(table: string, syncId: string, field: string, delta: SqlValue): void;
 };
 
@@ -686,7 +690,8 @@ function createEngine<T extends string>(
                 }
                 const current = row(table, syncId);
                 if (!current || current.deleted_at !== null) throw new MissingRowError(table, syncId);
-                guardRow(table, syncId);
+                // A provisional row may take the delta: neither reaches the server, and the
+                // delta goes with the row (releaseProvisional) or with its own change.
                 db.run(`UPDATE ${table} SET ${field} = ? WHERE sync_id = ?`, [
                     addValues(current[field], delta),
                     syncId,
