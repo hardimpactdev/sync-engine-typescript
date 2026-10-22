@@ -132,9 +132,10 @@ outbox entry. A pull that brings one of those rows keeps the provisional delta
 on top, as it keeps queued counters. They go when the server has answered the
 change:
 
-- **Applied:** at the end of the next pull with `has_more: false`, which holds
-  the server's own rows. During a pull of several pages, a pulled row can show
-  both until the last page.
+- **Applied:** a pulled row holds the change's result already, so a delta on it
+  settles when the row arrives, also in a pull that stops halfway. The rest goes
+  at the end of the next pull with `has_more: false`, which holds the server's
+  own rows.
 - **Rejected,** or dropped by a pulled tombstone or a cancelled parent: at once.
 
 Removing a row keeps its unsent action, also when the server never saw the
@@ -156,6 +157,40 @@ optional link is cleared, a required link takes the provisional row along.
 This needs `syncEngineSchemaV2`, a later migration step than
 `syncEngineSchemaV1`. It adds the `sync_provisional` table and a `merge` column
 on the outbox.
+
+## Proposed rows
+
+With a server that supports proposals (protocol §5.5), a provisional row can be
+the server's row to be. The provisional writer's `insert` takes a `key` that
+names the row in the action, such as `pantry_item`; the change then proposes
+the row's id under that key, and the server makes its row under it, or names
+the row it used.
+
+```ts
+store.update("shopping_items", itemId, { purchased: 1 }, {
+    provisional: (local) => {
+        const stock = local.insert("stock", { team_id: teamId, name: "Flour" }, { key: "stock" });
+        local.insert("movements", { team_id: teamId, stock_id: stock, delta: "1.000" }, { key: "purchase" });
+    },
+});
+```
+
+Until the answer, such a row takes writes, references, deltas and a delete like
+any other row (`store.isProposed(table, id)`); they go after the change. With
+the answer (`made`):
+
+- **Made under its id:** the row is the server's. It stays, and the pull brings
+  its values.
+- **Made or found under another id:** that row takes its place, with every
+  reference and unsent change, as in a remap.
+- **Not made,** or the change refused: the row goes, with the unsent changes
+  that need it.
+
+The store proposes only while the scope's server announces the feature
+(`noteFeatures`, which the sync client calls with every answer). Before that a
+key is ignored, and the row stays read-only as above. This needs
+`syncEngineSchemaV3`, a later migration step than `syncEngineSchemaV2`; it reads
+the schema first, so it runs on any earlier database.
 
 ## Account merge
 

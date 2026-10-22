@@ -54,6 +54,15 @@ export function takeBatch(
     });
 }
 
+/**
+ * Records what the scope's server supports, from each answer (protocol §5.5). A change
+ * proposes row ids only while the server announces `proposals`.
+ */
+export function noteFeatures(store: LocalStore, scopeId: string, features: readonly string[] | undefined) {
+    const engine = engineOf(store);
+    engine.transaction(() => engine.noteFeatures(scopeId, features));
+}
+
 /** Puts a failed batch back to `pending`. Its changes keep their ids and payloads. */
 export function returnToPending(store: LocalStore, scopeId: string, changeIds?: string[]) {
     const engine = engineOf(store);
@@ -116,6 +125,7 @@ export function applyAcks(store: LocalStore, scopeId: string, acks: Ack[]): AckR
             }
             engine.db.run("DELETE FROM sync_outbox WHERE position = ?", [entry.position]);
             engine.ackProvisional(entry.change_id);
+            engine.adoptProposals(entry, ack.made, ack.seq);
             const row = engine.row(entry.entity, entry.row_id);
             if (entry.op === "delete") {
                 if (row && row.deleted_at !== null) engine.deleteWithProvisional(entry.entity, entry.row_id);
@@ -316,6 +326,7 @@ function toWire(entry: OutboxEntry): WireChange {
         position: entry.position,
         ...(entry.depends_on === null ? {} : { depends_on: files(entry) }),
         ...(entry.merge ? { merge: true } : {}),
+        ...(entry.proposals ? { proposals: JSON.parse(entry.proposals) as Record<string, string> } : {}),
         client_time: entry.created_at,
     };
 }

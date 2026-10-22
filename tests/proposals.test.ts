@@ -1,0 +1,276 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createSyncClient, type SyncTransport } from "../src/client.ts";
+import { ProvisionalRowError } from "../src/store.ts";
+import { applyAcks, applyPullPage, noteFeatures, takeBatch } from "../src/sync.ts";
+import { outbox, pulled, scope, setup, type Store } from "./setup.ts";
+
+// Proposed rows (protocol §5.5). An action the server runs, here a bake that shelves the
+// cake in a new room, makes rows on the server. The device shows the room at once under an
+// id it proposes; the server adopts that id, or names the room it used. So the room takes
+// writes and references at once, and the server's answer replaces nothing.
+
+const cake = "01JBC59ZQ0B2D4F6H8K0M2P4R7";
+const serverRoom = "01JBC59ZQ0B2D4F6H8K0M2P4V1";
+
+function kitchen({ proposals = true } = {}) {
+    const { store, db } = setup();
+    pulled(store, "items", cake, { name: "Cake", notes: null, room_id: null }, 1);
+    if (proposals) noteFeatures(store, scope, ["proposals"]);
+    return { store, db };
+}
+
+/** Bakes the cake; the server shelves it in a new room, which the device shows at once. */
+function bake(store: Store, notes = "Baked") {
+    let room = "";
+    store.update(
+        "items",
+        cake,
+        { notes },
+        { provisional: (local) => void (room = local.insert("rooms", { scope_id: scope, name: "Pantry" }, { key: "room" })) },
+    );
+    return room;
+}
+
+function provisional(store: Store) {
+    return store.get<{ count: number }>("SELECT COUNT(*) AS count FROM sync_provisional")!.count;
+}
+
+function roomOf(store: Store, item: string) {
+    return store.get<{ room_id: string | null }>("SELECT room_id FROM items WHERE sync_id = ?", [item])?.room_id;
+}
+
+/** The server applies the bake and answers which room it made or used. */
+function serverBakes(store: Store, made: Record<string, string> | undefined, seq = 5) {
+    const [change] = takeBatch(store, scope);
+    applyAcks(store, scope, [{ change_id: change.change_id, status: "applied", seq, ...(made ? { made } : {}) }]);
+    return change;
+}
+
+test("before the server announces proposals, a change proposes nothing and its row stays read-only", () => {
+    const { store } = kitchen({ proposals: false });
+    const room = bake(store);
+
+    const [change] = takeBatch(store, scope);
+    assert.equal(change.proposals, undefined);
+    assert.equal(store.isProposed("rooms", room), false);
+    assert.throws(() => store.update("rooms", room, { name: "Larder" }), ProvisionalRowError);
+});
+
+test("each answer says whether the server takes proposals", () => {
+    const { store } = kitchen();
+    assert.equal(store.isProposed("rooms", bake(store)), true);
+    noteFeatures(store, scope, []);
+    assert.equal(store.isProposed("rooms", bake(store, "Baked again")), false);
+});
+
+test("a proposed row takes writes, references and links at once, after its change", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+
+    store.update("rooms", room, { name: "Larder" });
+    const jar = store.insert("items", { scope_id: scope, name: "Jar", room_id: room });
+    assert.equal(store.isProposed("rooms", room), true);
+
+    const batch = takeBatch(store, scope);
+    assert.deepEqual(
+        batch.map((change) => [change.entity, change.op, change.proposals ?? null]),
+        [
+            ["items", "upsert", { room }],
+            ["rooms", "upsert", null],
+            ["items", "upsert", null],
+        ],
+    );
+    assert.deepEqual(batch[2].fields, { name: "Jar", room_id: room });
+    assert.equal(roomOf(store, jar), room);
+});
+
+test("a row made under its proposed id is the server's: it stays, and the pull brings its values", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+
+    serverBakes(store, { room });
+    assert.equal(store.isProvisional("rooms", room), false);
+    assert.equal(store.get<{ server_seq: number }>("SELECT server_seq FROM rooms WHERE sync_id = ?", [room])?.server_seq, 5);
+
+    applyPullPage(store, scope, {
+        changes: [{ entity: "rooms", id: room, seq: 6, op: "upsert", row: { name: "Pantry shelf" } }],
+        cursor: "c6",
+        has_more: false,
+    });
+    assert.equal(store.get<{ name: string }>("SELECT name FROM rooms WHERE sync_id = ?", [room])?.name, "Pantry shelf");
+    assert.equal(provisional(store), 0);
+});
+
+test("a row the server made under another id moves there, with the unsent changes that need it", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+    store.update("rooms", room, { name: "Larder" });
+    const jar = store.insert("items", { scope_id: scope, name: "Jar", room_id: room });
+    // Only the bake is sent; the rename and the jar wait.
+    const [first] = takeBatch(store, scope, { limit: 1 });
+    applyAcks(store, scope, [{ change_id: first.change_id, status: "applied", seq: 5, made: { room: serverRoom } }]);
+
+    assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
+    assert.equal(store.get<{ name: string }>("SELECT name FROM rooms WHERE sync_id = ?", [serverRoom])?.name, "Larder");
+    assert.equal(roomOf(store, jar), serverRoom);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.row_id, entry.payload]),
+        [
+            ["rooms", serverRoom, { name: "Larder" }],
+            ["items", jar, { name: "Jar", room_id: serverRoom }],
+        ],
+    );
+});
+
+test("a row the server used already takes the proposed row's place", () => {
+    const { store } = kitchen();
+    pulled(store, "rooms", serverRoom, { name: "Pantry" }, 2);
+    const room = bake(store);
+    const jar = store.insert("items", { scope_id: scope, name: "Jar", room_id: room });
+
+    serverBakes(store, { room: serverRoom });
+    assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
+    assert.equal(roomOf(store, jar), serverRoom);
+    assert.equal(store.isProvisional("rooms", serverRoom), false);
+});
+
+test("a key the server did not make takes its row and the unsent changes that need it", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+    store.update("rooms", room, { name: "Larder" });
+    const jar = store.insert("items", { scope_id: scope, name: "Jar", room_id: room });
+    const [first] = takeBatch(store, scope, { limit: 1 });
+    applyAcks(store, scope, [{ change_id: first.change_id, status: "applied", seq: 5, made: {} }]);
+
+    assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
+    // The rename goes; the jar stays, without the link (an optional one).
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.payload]),
+        [["items", { name: "Jar", room_id: null }]],
+    );
+    assert.equal(roomOf(store, jar), null);
+    assert.equal(provisional(store), 0);
+});
+
+test("an answer without made, from an older server, takes the proposed rows along", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+    store.update("rooms", room, { name: "Larder" });
+    const [first] = takeBatch(store, scope, { limit: 1 });
+    applyAcks(store, scope, [{ change_id: first.change_id, status: "applied", seq: 5 }]);
+
+    assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
+    assert.equal(outbox(store).length, 0);
+});
+
+test("a refused change takes its proposed rows and their unsent changes along", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+    store.update("rooms", room, { name: "Larder" });
+    const [first] = takeBatch(store, scope, { limit: 1 });
+    applyAcks(store, scope, [
+        { change_id: first.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null, room_id: null } },
+    ]);
+
+    assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
+    assert.equal(outbox(store).length, 0);
+    assert.equal(provisional(store), 0);
+});
+
+test("removing a proposed row before its change is answered deletes it after the change", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+    store.remove("rooms", room);
+
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.op]),
+        [
+            ["items", "upsert"],
+            ["rooms", "delete"],
+        ],
+    );
+    assert.notEqual(store.get<{ deleted_at: string | null }>("SELECT deleted_at FROM rooms WHERE sync_id = ?", [room])?.deleted_at, null);
+
+    serverBakes(store, { room }, 5);
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.row_id, entry.op]),
+        [["rooms", room, "delete"]],
+    );
+});
+
+test("a key used again in a merged change moves to the newer row", () => {
+    const { store } = kitchen();
+    const first = bake(store, "Baked");
+    const second = bake(store, "Baked twice");
+
+    const [change] = takeBatch(store, scope);
+    assert.deepEqual(change.proposals, { room: second });
+    assert.equal(store.isProposed("rooms", second), true);
+    assert.equal(store.isProposed("rooms", first), false);
+
+    // The server made one room, under the newer id. The older room was a prediction only.
+    applyAcks(store, scope, [{ change_id: change.change_id, status: "applied", seq: 5, made: { room: second } }]);
+    applyPullPage(store, scope, {
+        changes: [{ entity: "rooms", id: second, seq: 6, op: "upsert", row: { name: "Pantry" } }],
+        cursor: "c6",
+        has_more: false,
+    });
+    assert.deepEqual(
+        store.all<{ sync_id: string }>("SELECT sync_id FROM rooms").map((row) => row.sync_id),
+        [second],
+    );
+});
+
+test("a duplicate ack repeats made", () => {
+    const { store } = kitchen();
+    const room = bake(store);
+    const [change] = takeBatch(store, scope);
+    applyAcks(store, scope, [{ change_id: change.change_id, status: "duplicate", seq: 5, made: { room } }]);
+    assert.equal(store.isProvisional("rooms", room), false);
+    assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]) !== null, true);
+});
+
+test("a sync run learns the feature, sends proposals, and adopts what the server made", async () => {
+    const { store } = kitchen({ proposals: false });
+    const bodies: { changes: { proposals?: Record<string, string> }[] }[] = [];
+    let seq = 10;
+    const transport: SyncTransport = async (body) => {
+        bodies.push(body);
+        return {
+            status: 200,
+            body: {
+                protocol: 1,
+                acks: body.changes.map((change) => ({
+                    change_id: change.change_id,
+                    status: "applied",
+                    seq: ++seq,
+                    ...(change.proposals ? { made: change.proposals } : {}),
+                })),
+                changes: [],
+                cursor: `c${seq}`,
+                has_more: false,
+                server_time: "x",
+                features: ["proposals"],
+            },
+        };
+    };
+    const client = createSyncClient({
+        store,
+        scopeId: scope,
+        clientId: "01JBC4Y0R8T5D8M4QKX3N2V6ZA",
+        entities: ["items", "rooms"],
+        transport,
+    });
+
+    await client.sync();
+    const room = bake(store);
+    store.update("rooms", room, { name: "Larder" });
+    await client.sync();
+
+    const sent = bodies.at(-1)!.changes;
+    assert.deepEqual(sent[0].proposals, { room });
+    assert.equal(store.isProvisional("rooms", room), false);
+    assert.equal(store.get<{ name: string }>("SELECT name FROM rooms WHERE sync_id = ?", [room])?.name, "Larder");
+    assert.equal(outbox(store).length, 0);
+});

@@ -9,7 +9,7 @@ export {
 } from "./client.ts";
 export type { Row, SqlDatabase, SqlValue } from "./database.ts";
 export { addValues, negate } from "./decimal.ts";
-export { migrate, syncEngineSchemaV1, syncEngineSchemaV2, type Migration } from "./migrate.ts";
+export { migrate, syncEngineSchemaV1, syncEngineSchemaV2, syncEngineSchemaV3, type Migration } from "./migrate.ts";
 export type {
     Ack,
     PulledChange,
@@ -36,6 +36,7 @@ export {
     applyPullPage,
     cursorOf,
     maxBatchSize,
+    noteFeatures,
     pulledSeqOf,
     returnToPending,
     takeBatch,

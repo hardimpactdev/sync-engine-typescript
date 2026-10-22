@@ -5,6 +5,7 @@ import {
     applyAcks,
     applyPullPage,
     cursorOf,
+    noteFeatures,
     pulledSeqKey,
     returnToPending,
     takeBatch,
@@ -112,7 +113,12 @@ export function createSyncClient(options: SyncClientOptions): SyncClient {
                 return failure;
             }
 
-            const response = result.body as PullPage & { acks: Ack[]; last_position?: number };
+            const response = result.body as PullPage & {
+                acks: Ack[];
+                last_position?: number;
+                features?: string[];
+            };
+            noteFeatures(store, scopeId, response.features);
             if (ids.length) {
                 const acks = applyAcks(store, scopeId, response.acks);
                 const answered = new Set(response.acks.map((ack) => ack.change_id));

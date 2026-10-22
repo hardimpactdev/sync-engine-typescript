@@ -96,7 +96,7 @@ test("the server's rows replace the provisional result after a drained pull", ()
     assert.equal(provisional(store), 0);
 });
 
-test("a pulled row keeps the provisional delta until the pull is drained", () => {
+test("a pulled row holds an applied change's result, also before the pull is drained", () => {
     const { store } = kitchen();
     bake(store);
 
@@ -104,9 +104,11 @@ test("a pulled row keeps the provisional delta until the pull is drained", () =>
     pulled(store, "stock", flour, { name: "Flour", quantity: "6.000" }, 3);
     assert.equal(quantity(store), "4.000");
 
-    // The answer to the change has more pages: the result stays until the last one.
+    // The answer to the change has more pages. The server applied the change before it read
+    // the flour for the page, so the pulled flour holds it: never counted twice, also if the
+    // pull stops here. The provisional movement waits for the last page.
     serverBakes(store, { hasMore: true });
-    assert.equal(quantity(store), "1.000");
+    assert.equal(quantity(store), "3.000");
     assert.equal(movements(store).length, 2);
 
     applyPullPage(store, scope, { changes: [], cursor: "c6", has_more: false });
@@ -294,7 +296,8 @@ test("a remap moves the provisional delta to the server's row", () => {
         cursor: "c5",
         has_more: true,
     });
-    assert.equal(jarStock(), "3.000");
+    // The pulled jar holds the applied change already.
+    assert.equal(jarStock(), "4.000");
 
     applyPullPage(store, scope, { changes: [], cursor: "c6", has_more: false });
     assert.equal(jarStock(), "4.000");

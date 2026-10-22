@@ -49,8 +49,13 @@ export type ProvisionalWriter = {
     /**
      * Adds a row that only this device has, and returns its sync_id. Only other provisional
      * rows may point at it; they follow it when it goes, as through a foreign key.
+     *
+     * With a `key`, and a server that announced proposals (protocol §5.5), the change
+     * proposes the row's id under that key: the server makes its row under it, or names
+     * the row it used. Until then the row takes writes and references like any other, and
+     * they go after the change. Needs `syncEngineSchemaV3`.
      */
-    insert(table: string, values: Row): string;
+    insert(table: string, values: Row, options?: { key?: string }): string;
     /**
      * Adds a delta to a counter: a field that an operation's counters change, such as stock.
      * The row may be provisional itself, made by an earlier change: the delta builds on that
@@ -96,6 +101,11 @@ export interface LocalStore<T extends string = string> {
     ): void;
     /** Whether a row is provisional: made only here, until the server's result replaces it. */
     isProvisional(table: T, syncId: string): boolean;
+    /**
+     * Whether a provisional row's id is proposed to the server (protocol §5.5): it takes
+     * writes, references and a delete, which go after the change that makes it.
+     */
+    isProposed(table: T, syncId: string): boolean;
     subscribe(tables: readonly (T | EngineTable)[], listener: () => void): () => void;
     /** Changes whenever one of the tables changes, for useSyncExternalStore. */
     version(tables: readonly (T | EngineTable)[]): string;
@@ -116,6 +126,8 @@ export type OutboxEntry = {
     created_at: string;
     /** 1 for an account merge (syncEngineSchemaV2); absent before it. */
     merge?: number;
+    /** JSON `{key: sync_id}` of the rows the change proposes (syncEngineSchemaV3). */
+    proposals?: string | null;
 };
 
 export class MissingRowError extends Error {
@@ -143,7 +155,11 @@ type ProvisionalEffect = {
     field: string | null;
     delta: SqlValue;
     acked: number;
+    /** The key under which the change proposes the row's id (syncEngineSchemaV3). */
+    proposal?: string | null;
 };
+
+const proposalKey = /^[a-z0-9_\-:|.]{1,64}$/;
 
 /** Columns every synced row has, with the scope column. The store and sync set them; a caller never does. */
 const rowConventions = [
@@ -253,7 +269,7 @@ export function createLocalStore<T extends string>(
                 // cook. It stays, with the changes it builds on: the server runs it, then
                 // the delete. Dropping it would take back a result the server may already
                 // have from another device, or turn it into a second, unrelated change.
-                const known = engine.knownToServer(row, entries);
+                const known = engine.knownToServer(row, entries, table);
                 const action =
                     entries.some(
                         (entry) => engine.unsent(entry) && engine.carriesProvisional(entry.change_id),
@@ -296,6 +312,7 @@ export function createLocalStore<T extends string>(
         },
 
         isProvisional: (table, syncId) => engine.isProvisionalRow(table, syncId),
+        isProposed: (table, syncId) => engine.isProposedRow(table, syncId),
 
         subscribe(tables, listener) {
             for (const table of tables) {
@@ -465,8 +482,13 @@ function createEngine<T extends string>(
         return entry.state === "pending" && entry.attempts === 0;
     }
 
-    function knownToServer(values: Row, entries: OutboxEntry[]): boolean {
-        return values.server_seq !== null || entries.some((entry) => !unsent(entry));
+    /** A proposed row counts as known: the change that proposes it makes it on the server. */
+    function knownToServer(values: Row, entries: OutboxEntry[], entity?: string): boolean {
+        return (
+            values.server_seq !== null ||
+            entries.some((entry) => !unsent(entry)) ||
+            (entity !== undefined && isProposedRow(entity, String(values.sync_id)))
+        );
     }
 
     function append(
@@ -663,7 +685,7 @@ function createEngine<T extends string>(
         work({
             get: (sql, params = []) => db.get(sql, params),
             all: (sql, params = []) => db.all(sql, params),
-            insert(table, values) {
+            insert(table, values, { key } = {}) {
                 spec(table);
                 for (const column of Object.keys(values)) {
                     if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
@@ -671,6 +693,7 @@ function createEngine<T extends string>(
                         throw new Error(`The store sets ${column} itself.`);
                     }
                 }
+                if (key !== undefined && !proposalKey.test(key)) throw new Error(`${key} is not a proposal key.`);
                 const syncId = newId();
                 const stamp = now();
                 const names = ["sync_id", ...Object.keys(values), "created_at", "updated_at"];
@@ -679,6 +702,7 @@ function createEngine<T extends string>(
                     [syncId, ...Object.values(values), stamp, stamp],
                 );
                 record(table, syncId, null, null);
+                if (key !== undefined && proposes(entry.scope_id)) propose(entry, key, table, syncId);
                 touch(table);
                 return syncId;
             },
@@ -710,6 +734,99 @@ function createEngine<T extends string>(
         );
     }
 
+    // Proposed rows (protocol §5.5, syncEngineSchemaV3). With a server that announced
+    // proposals, a change proposes the ids of the provisional rows its action makes. The
+    // server adopts them or names the row it used (`made`), so such a row takes writes and
+    // references at once: they go after the change in the outbox.
+
+    let proposalsReady: boolean | null = null;
+    function hasProposals(): boolean {
+        proposalsReady ??= hasProvisional() && columns("sync_provisional").has("proposal");
+        return proposalsReady;
+    }
+
+    /** Whether the scope's server announced proposals in its last answer. */
+    function proposes(scopeId: string): boolean {
+        return (
+            hasProposals() &&
+            db.get("SELECT 1 FROM local_meta WHERE key = ? AND value = '1'", [`sync.proposals.${scopeId}`]) !== null
+        );
+    }
+
+    /** Records what the server supports, from each answer (protocol §5.5). */
+    function noteFeatures(scopeId: string, features: readonly string[] | undefined) {
+        if (!hasProposals()) return;
+        db.run(
+            "INSERT INTO local_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [`sync.proposals.${scopeId}`, features?.includes("proposals") ? "1" : "0"],
+        );
+    }
+
+    /** The change proposes this row's id under `key`. A key used again moves to the newer row. */
+    function propose(entry: OutboxEntry, key: string, entity: string, rowId: string) {
+        const current = db.get<{ proposals: string | null }>(
+            "SELECT proposals FROM sync_outbox WHERE change_id = ?",
+            [entry.change_id],
+        );
+        const proposals = JSON.parse(current?.proposals ?? "{}") as Record<string, string>;
+        if (proposals[key] !== undefined) {
+            db.run("UPDATE sync_provisional SET proposal = NULL WHERE change_id = ? AND proposal = ?", [
+                entry.change_id,
+                key,
+            ]);
+        }
+        proposals[key] = rowId;
+        db.run("UPDATE sync_provisional SET proposal = ? WHERE change_id = ? AND entity = ? AND row_id = ? AND field IS NULL", [
+            key,
+            entry.change_id,
+            entity,
+            rowId,
+        ]);
+        db.run("UPDATE sync_outbox SET proposals = ? WHERE change_id = ?", [JSON.stringify(proposals), entry.change_id]);
+        touch("sync_outbox");
+    }
+
+    function isProposedRow(entity: string, rowId: string): boolean {
+        return (
+            hasProposals() &&
+            db.get(
+                "SELECT 1 FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NULL AND proposal IS NOT NULL",
+                [entity, rowId],
+            ) !== null
+        );
+    }
+
+    /**
+     * The server answered a change that proposed rows (`made`). A row made under its id is
+     * the server's now: it stays, and the pull brings its values. A row made under another
+     * id, or an existing row the action used, takes the proposed row's place as in a
+     * remap. A key the server did not make takes its row along, with the unsent changes
+     * that need it.
+     */
+    function adoptProposals(entry: OutboxEntry, made: Record<string, string> | undefined, seq: number | undefined) {
+        if (!entry.proposals || !hasProposals()) return;
+        const proposals = JSON.parse(entry.proposals) as Record<string, string>;
+        for (const [key, proposed] of Object.entries(proposals)) {
+            const effect = db.get<ProvisionalEffect>(
+                "SELECT * FROM sync_provisional WHERE change_id = ? AND proposal = ? AND field IS NULL",
+                [entry.change_id, key],
+            );
+            if (!effect) continue;
+            const to = made?.[key];
+            db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
+            if (to === undefined) {
+                if (row(effect.entity, proposed)) cancel(effect.entity, proposed);
+                continue;
+            }
+            if (to !== proposed) remap(effect.entity, proposed, to);
+            db.run(
+                `UPDATE ${effect.entity} SET server_seq = MAX(COALESCE(server_seq, 0), ?) WHERE sync_id = ?`,
+                [seq ?? 0, to],
+            );
+            touch(effect.entity);
+        }
+    }
+
     function isProvisionalRow(entity: string, rowId: string): boolean {
         if (!hasProvisional()) return false;
         return (
@@ -720,9 +837,14 @@ function createEngine<T extends string>(
         );
     }
 
-    /** Refuses a write to a provisional row: the server's own row replaces it. */
+    /**
+     * Refuses a write to a provisional row: the server's own row replaces it. A proposed
+     * row is the server's row to be, so it takes writes.
+     */
     function guardRow(entity: string, rowId: string) {
-        if (isProvisionalRow(entity, rowId)) throw new ProvisionalRowError(entity, rowId);
+        if (isProvisionalRow(entity, rowId) && !isProposedRow(entity, rowId)) {
+            throw new ProvisionalRowError(entity, rowId);
+        }
     }
 
     /** Refuses a reference to a provisional row: the server would not know it. */
@@ -740,7 +862,7 @@ function createEngine<T extends string>(
             "SELECT entity FROM sync_provisional WHERE row_id = ? AND field IS NULL",
             [scopeId],
         );
-        if (found) throw new ProvisionalRowError(found.entity, scopeId);
+        if (found && !isProposedRow(found.entity, scopeId)) throw new ProvisionalRowError(found.entity, scopeId);
     }
 
     /** Removes provisional results: of one change, or of the changes the server applied in a scope. */
@@ -762,7 +884,9 @@ function createEngine<T extends string>(
             const current = row(effect.entity, effect.row_id);
             if (!current) continue;
             if (effect.field === null) {
-                deleteWithProvisional(effect.entity, effect.row_id);
+                // A proposed row takes the unsent changes made to it along.
+                if (effect.proposal) cancel(effect.entity, effect.row_id);
+                else deleteWithProvisional(effect.entity, effect.row_id);
                 continue;
             }
             db.run(`UPDATE ${effect.entity} SET ${effect.field} = ? WHERE sync_id = ?`, [
@@ -830,7 +954,11 @@ function createEngine<T extends string>(
             const child = row(mention.entity, mention.row_id);
             const childEntries = entriesFor(mention.entity, mention.row_id);
             if (childEntries.some((entry) => unsent(entry) && carriesProvisional(entry.change_id))) return true;
-            if (child && !knownToServer(child, childEntries) && actionNeeds(mention.entity, mention.row_id, seen))
+            if (
+                child &&
+                !knownToServer(child, childEntries, mention.entity) &&
+                actionNeeds(mention.entity, mention.row_id, seen)
+            )
                 return true;
         }
         return false;
@@ -877,7 +1005,7 @@ function createEngine<T extends string>(
             if (!clearOptionalFields(entry, entity, rowId)) continue;
             const child = row(entry.entity, entry.row_id);
             const entries = entriesFor(entry.entity, entry.row_id);
-            if (child && !knownToServer(child, entries) && entries[0].position === entry.position) {
+            if (child && !knownToServer(child, entries, entry.entity) && entries[0].position === entry.position) {
                 cancel(entry.entity, entry.row_id);
                 continue;
             }
@@ -1039,6 +1167,12 @@ function createEngine<T extends string>(
             if (hit.field in values) values[hit.field] = addValues(values[hit.field], hit.delta);
         }
         for (const effect of provisionalOn(entity, syncId)) {
+            // The server applied the change before it read this row for the page, so the
+            // row holds the result already: the delta settles here, not again on top.
+            if (effect.acked) {
+                db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
+                continue;
+            }
             if (effect.field! in values) values[effect.field!] = addValues(values[effect.field!], effect.delta);
         }
         if (seq !== undefined) values.server_seq = seq;
@@ -1227,6 +1361,9 @@ function createEngine<T extends string>(
         hasProvisional,
         writeProvisional,
         isProvisionalRow,
+        isProposedRow,
+        noteFeatures,
+        adoptProposals,
         guardRow,
         guardReferences,
         guardScope,

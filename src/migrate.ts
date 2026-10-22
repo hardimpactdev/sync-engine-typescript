@@ -128,3 +128,14 @@ export const syncEngineSchemaV2: Migration = (db) => {
         db.exec("ALTER TABLE sync_outbox ADD COLUMN merge INTEGER NOT NULL DEFAULT 0");
     }
 };
+
+/**
+ * Proposed rows (protocol §5.5): the ids an outbox entry proposes, and the key of each
+ * provisional row whose id it proposes. Reads the schema first, so it runs on any earlier one.
+ */
+export const syncEngineSchemaV3: Migration = (db) => {
+    const has = (table: string, column: string) =>
+        db.all<{ name: string }>(`PRAGMA table_info(${table})`).some((found) => found.name === column);
+    if (!has("sync_outbox", "proposals")) db.exec("ALTER TABLE sync_outbox ADD COLUMN proposals TEXT");
+    if (!has("sync_provisional", "proposal")) db.exec("ALTER TABLE sync_provisional ADD COLUMN proposal TEXT");
+};
