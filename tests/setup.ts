@@ -3,6 +3,7 @@ import { migrate, syncEngineSchemaV1, syncEngineSchemaV2, syncEngineSchemaV3 } f
 import { createLocalStore } from "../src/store.ts";
 import { applyPullPage } from "../src/sync.ts";
 import type { Row } from "../src/database.ts";
+import type { EntitySpec } from "../src/spec.ts";
 import { memoryDatabase } from "./memory-database.ts";
 
 // A neutral schema like the fixtures': rooms, items in rooms, counters with an
@@ -55,7 +56,13 @@ export const scope = "01J9XX0A1B2C3D4E5F6G7H8J9K";
 export function setup({
     ids = [],
     onListenerError,
-}: { ids?: string[]; onListenerError?: (error: unknown) => void } = {}) {
+    convert,
+}: {
+    ids?: string[];
+    onListenerError?: (error: unknown) => void;
+    /** The stock's `convert`; a recorded movement then counts its delta in its `unit`. */
+    convert?: EntitySpec["convert"];
+} = {}) {
     const db = memoryDatabase();
     migrate(db, testMigrations);
     let id = 0;
@@ -74,10 +81,19 @@ export function setup({
                 writable: [],
                 operations: {
                     record: {
-                        counters: [{ entity: "stock", row: "stock_id", field: "quantity", delta: "delta" }],
+                        counters: [
+                            {
+                                entity: "stock",
+                                row: "stock_id",
+                                field: "quantity",
+                                delta: "delta",
+                                ...(convert ? { basis: "unit" } : {}),
+                            },
+                        ],
                     },
                 },
             },
+            ...(convert ? { stock: { convert } } : {}),
         },
         newId: () => queue.shift() ?? `ID${String(++id).padStart(4, "0")}`,
         now: () => fixed ?? new Date(Date.UTC(2026, 9, 20, 9, 0, clock++)).toISOString(),

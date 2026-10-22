@@ -91,7 +91,8 @@ test("a row made under its proposed id is the server's: it stays, and the pull b
 
     serverBakes(store, { room });
     assert.equal(store.isProvisional("rooms", room), false);
-    assert.equal(store.get<{ server_seq: number }>("SELECT server_seq FROM rooms WHERE sync_id = ?", [room])?.server_seq, 5);
+    // Known to the server, with no seq of its own until its row arrives.
+    assert.equal(store.get<{ server_seq: number }>("SELECT server_seq FROM rooms WHERE sync_id = ?", [room])?.server_seq, 0);
 
     applyPullPage(store, scope, {
         changes: [{ entity: "rooms", id: room, seq: 6, op: "upsert", row: { name: "Pantry shelf" } }],
@@ -290,4 +291,68 @@ test("a sync run learns the feature, sends proposals, and adopts what the server
     assert.equal(store.isProvisional("rooms", room), false);
     assert.equal(store.get<{ name: string }>("SELECT name FROM rooms WHERE sync_id = ?", [room])?.name, "Larder");
     assert.equal(outbox(store).length, 0);
+});
+
+// A delta counted in a unit, such as grams, lands in what its row holds now, such as
+// kilograms: the server may hold the row in another unit, or a proposed row may move to an
+// existing row in another one. Here stock is counted in pieces or in dozens, by its name.
+const dozens = (name: unknown) => String(name).endsWith("(dozens)");
+const convert = (_field: string, delta: unknown, basis: string, target: Record<string, unknown>) => {
+    const pieces = basis === "dozen" ? Number(delta) * 12 : Number(delta);
+    return (dozens(target.name) ? pieces / 12 : pieces).toFixed(3);
+};
+const eggs = "01JBC59ZQ0B2D4F6H8K0M2P4V2";
+
+test("a provisional delta lands in what its row holds, also after the server changed it", () => {
+    const { store } = setup({ convert });
+    pulled(store, "items", cake, { name: "Cake", notes: null, room_id: null }, 1);
+    pulled(store, "stock", eggs, { name: "Eggs", quantity: "24.000" }, 2);
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        { provisional: (local) => local.add("stock", eggs, "quantity", "-6.000", "piece") },
+    );
+    const quantity = () => store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [eggs])?.quantity;
+    assert.equal(quantity(), "18.000");
+
+    // The web counts eggs in dozens now; the waiting use still takes six eggs.
+    pulled(store, "stock", eggs, { name: "Eggs (dozens)", quantity: "2.000" }, 3);
+    assert.equal(quantity(), "1.500");
+
+    // Refused: exactly the six eggs come back.
+    const [change] = takeBatch(store, scope);
+    applyAcks(store, scope, [
+        { change_id: change.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null, room_id: null } },
+    ]);
+    assert.equal(quantity(), "2.000");
+});
+
+test("a queued operation's delta lands in its row's unit, also on a row it moved to", () => {
+    const { store } = setup({ convert });
+    pulled(store, "items", cake, { name: "Cake", notes: null, room_id: null }, 1);
+    noteFeatures(store, scope, ["proposals"]);
+    let box = "";
+    store.update(
+        "items",
+        cake,
+        { notes: "Bought eggs" },
+        { provisional: (local) => void (box = local.insert("stock", { scope_id: scope, name: "Eggs", quantity: "12.000" }, { key: "stock" })) },
+    );
+    // A correction on the proposed box, counted in pieces.
+    const correction = "01JBC59ZQ0B2D4F6H8K0M2P4V3";
+    store.operate("movements", correction, "record", { stock_id: box, delta: "6.000", unit: "piece" }, (local) =>
+        local.put("movements", correction, { scope_id: scope, stock_id: box, delta: "6.000" }),
+    );
+    assert.equal(store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [box])?.quantity, "18.000");
+
+    // The server put the eggs on its box counted in dozens; the correction lands there in dozens.
+    const [first] = takeBatch(store, scope, { limit: 1 });
+    applyAcks(store, scope, [{ change_id: first.change_id, status: "applied", seq: 5, made: { stock: eggs } }]);
+    applyPullPage(store, scope, {
+        changes: [{ entity: "stock", id: eggs, seq: 6, op: "upsert", row: { name: "Eggs (dozens)", quantity: "3.000" } }],
+        cursor: "c6",
+        has_more: false,
+    });
+    assert.equal(store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [eggs])?.quantity, "3.500");
 });

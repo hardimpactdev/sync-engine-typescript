@@ -125,7 +125,7 @@ export function applyAcks(store: LocalStore, scopeId: string, acks: Ack[]): AckR
             }
             engine.db.run("DELETE FROM sync_outbox WHERE position = ?", [entry.position]);
             engine.ackProvisional(entry.change_id);
-            engine.adoptProposals(entry, ack.made, ack.seq);
+            engine.adoptProposals(entry, ack.made);
             const row = engine.row(entry.entity, entry.row_id);
             if (entry.op === "delete") {
                 if (row && row.deleted_at !== null) engine.deleteWithProvisional(entry.entity, entry.row_id);

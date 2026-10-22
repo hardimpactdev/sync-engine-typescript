@@ -59,9 +59,10 @@ export type ProvisionalWriter = {
     /**
      * Adds a delta to a counter: a field that an operation's counters change, such as stock.
      * The row may be provisional itself, made by an earlier change: the delta builds on that
-     * result, and goes when the row goes.
+     * result, and goes when the row goes. A `basis`, such as the delta's unit, lands it
+     * through the entity's `convert` whenever the row's own changes (syncEngineSchemaV3).
      */
-    add(table: string, syncId: string, field: string, delta: SqlValue): void;
+    add(table: string, syncId: string, field: string, delta: SqlValue, basis?: string): void;
 };
 
 /** Writes rows for an operation's local effect. These writes get no outbox entry of their own. */
@@ -157,6 +158,8 @@ type ProvisionalEffect = {
     acked: number;
     /** The key under which the change proposes the row's id (syncEngineSchemaV3). */
     proposal?: string | null;
+    /** What the delta is counted in, such as its unit (syncEngineSchemaV3). */
+    basis?: string | null;
 };
 
 const proposalKey = /^[a-z0-9_\-:|.]{1,64}$/;
@@ -180,10 +183,18 @@ type Spec = {
     operations: Map<string, { counters: readonly CounterSpec[]; references: Map<string, string> }>;
     counterFields: Set<string>;
     scope: NonNullable<EntitySpec["scope"]>;
+    convert: EntitySpec["convert"];
 };
 
 /** A counter of one queued operation that lands on a row. */
-type CounterHit = { entry: OutboxEntry; entity: string; row: string; field: string; delta: SqlValue };
+type CounterHit = {
+    entry: OutboxEntry;
+    entity: string;
+    row: string;
+    field: string;
+    delta: SqlValue;
+    basis: string | null;
+};
 
 /** The store's inside, for the sync functions in sync.ts. */
 export type Engine = ReturnType<typeof createEngine>;
@@ -598,9 +609,21 @@ function createEngine<T extends string>(
                 row: target,
                 field: counter.field,
                 delta: args[counter.delta] ?? null,
+                basis: basisOf(counter, args),
             });
         }
         return hits;
+    }
+
+    function basisOf(counter: CounterSpec, args: Row): string | null {
+        const basis = counter.basis ? args[counter.basis] : null;
+        return typeof basis === "string" ? basis : null;
+    }
+
+    /** A delta counted in `basis`, in what the row holds now (the entity's `convert`). */
+    function landed(entity: string, field: string, delta: SqlValue, basis: string | null | undefined, target: Row): SqlValue {
+        const convert = specs.get(entity)?.convert;
+        return convert && typeof basis === "string" ? convert(field, delta, basis, target) : delta;
     }
 
     /** The queued operations whose counters land on one row. */
@@ -624,6 +647,7 @@ function createEngine<T extends string>(
                     row: rowId,
                     field: counter.field,
                     delta: args[counter.delta] ?? null,
+                    basis: basisOf(counter, args),
                 });
             }
         }
@@ -639,12 +663,11 @@ function createEngine<T extends string>(
         for (const hit of countersOf(entry)) {
             if (except && hit.entity === except.entity && hit.row === except.row) continue;
             if (!columns(hit.entity).has(hit.field)) continue;
-            const current = db.get<Row>(`SELECT ${hit.field} FROM ${hit.entity} WHERE sync_id = ?`, [
-                hit.row,
-            ]);
+            const current = row(hit.entity, hit.row);
             if (!current) continue;
+            const delta = landed(hit.entity, hit.field, hit.delta, hit.basis, current);
             db.run(`UPDATE ${hit.entity} SET ${hit.field} = ? WHERE sync_id = ?`, [
-                addValues(current[hit.field], sign === 1 ? hit.delta : negate(hit.delta)),
+                addValues(current[hit.field], sign === 1 ? delta : negate(delta)),
                 hit.row,
             ]);
             touch(hit.entity);
@@ -679,11 +702,16 @@ function createEngine<T extends string>(
         if (!hasProvisional()) {
             throw new Error("Provisional results need syncEngineSchemaV2 in the app's migrations.");
         }
-        const record = (entity: string, rowId: string, field: string | null, delta: SqlValue) =>
-            db.run(
-                "INSERT INTO sync_provisional (change_id, scope_id, entity, row_id, field, delta) VALUES (?, ?, ?, ?, ?, ?)",
-                [entry.change_id, entry.scope_id, entity, rowId, field, delta],
-            );
+        const record = (entity: string, rowId: string, field: string | null, delta: SqlValue, basis?: string) =>
+            basis !== undefined && hasProposals()
+                ? db.run(
+                      "INSERT INTO sync_provisional (change_id, scope_id, entity, row_id, field, delta, basis) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      [entry.change_id, entry.scope_id, entity, rowId, field, delta, basis],
+                  )
+                : db.run(
+                      "INSERT INTO sync_provisional (change_id, scope_id, entity, row_id, field, delta) VALUES (?, ?, ?, ?, ?, ?)",
+                      [entry.change_id, entry.scope_id, entity, rowId, field, delta],
+                  );
         work({
             get: (sql, params = []) => db.get(sql, params),
             all: (sql, params = []) => db.all(sql, params),
@@ -708,7 +736,7 @@ function createEngine<T extends string>(
                 touch(table);
                 return syncId;
             },
-            add(table, syncId, field, delta) {
+            add(table, syncId, field, delta, basis) {
                 spec(table);
                 // Only a counter: no write may set it, so the delta can always be taken back.
                 if (!spec(table).counterFields.has(field)) {
@@ -719,10 +747,10 @@ function createEngine<T extends string>(
                 // A provisional row may take the delta: neither reaches the server, and the
                 // delta goes with the row (releaseProvisional) or with its own change.
                 db.run(`UPDATE ${table} SET ${field} = ? WHERE sync_id = ?`, [
-                    addValues(current[field], delta),
+                    addValues(current[field], landed(table, field, delta, basis, current)),
                     syncId,
                 ]);
-                record(table, syncId, field, delta);
+                record(table, syncId, field, delta, basis);
                 touch(table);
             },
         });
@@ -810,7 +838,7 @@ function createEngine<T extends string>(
      * remap. A key the server did not make takes its row along, with the unsent changes
      * that need it.
      */
-    function adoptProposals(entry: OutboxEntry, made: Record<string, string> | undefined, seq: number | undefined) {
+    function adoptProposals(entry: OutboxEntry, made: Record<string, string> | undefined) {
         if (!entry.proposals || !hasProposals()) return;
         const proposals = JSON.parse(entry.proposals) as Record<string, string>;
         for (const [key, proposed] of Object.entries(proposals)) {
@@ -826,10 +854,9 @@ function createEngine<T extends string>(
                 continue;
             }
             if (to !== proposed) remap(effect.entity, proposed, to);
-            db.run(
-                `UPDATE ${effect.entity} SET server_seq = MAX(COALESCE(server_seq, 0), ?) WHERE sync_id = ?`,
-                [seq ?? 0, to],
-            );
+            // Known to the server now, but with no seq of its own: the ack's seq is the
+            // change's, and would make the pull skip the row's own, lower one as stale.
+            db.run(`UPDATE ${effect.entity} SET server_seq = COALESCE(server_seq, 0) WHERE sync_id = ?`, [to]);
             touch(effect.entity);
         }
     }
@@ -897,7 +924,10 @@ function createEngine<T extends string>(
                 continue;
             }
             db.run(`UPDATE ${effect.entity} SET ${effect.field} = ? WHERE sync_id = ?`, [
-                addValues(current[effect.field], negate(effect.delta)),
+                addValues(
+                    current[effect.field],
+                    negate(landed(effect.entity, effect.field, effect.delta, effect.basis, current)),
+                ),
                 effect.row_id,
             ]);
             touch(effect.entity);
@@ -1170,8 +1200,11 @@ function createEngine<T extends string>(
                 if (known.has(column)) values[column] = value;
             }
         }
+        // Deltas land in what the pulled row holds, such as its unit now.
+        const target = { ...(row(entity, syncId) ?? {}), ...values };
         for (const hit of countersLandingOn(entity, syncId)) {
-            if (hit.field in values) values[hit.field] = addValues(values[hit.field], hit.delta);
+            if (hit.field in values)
+                values[hit.field] = addValues(values[hit.field], landed(entity, hit.field, hit.delta, hit.basis, target));
         }
         for (const effect of provisionalOn(entity, syncId)) {
             // The server applied the change before it read this row for the page, so the
@@ -1180,7 +1213,11 @@ function createEngine<T extends string>(
                 db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
                 continue;
             }
-            if (effect.field! in values) values[effect.field!] = addValues(values[effect.field!], effect.delta);
+            if (effect.field! in values)
+                values[effect.field!] = addValues(
+                    values[effect.field!],
+                    landed(entity, effect.field!, effect.delta, effect.basis, target),
+                );
         }
         if (seq !== undefined) values.server_seq = seq;
         const stamp = now();
@@ -1220,7 +1257,7 @@ function createEngine<T extends string>(
             for (const effect of provisionalOn(entity, from)) {
                 const current = row(entity, to)!;
                 db.run(`UPDATE ${entity} SET ${effect.field} = ? WHERE sync_id = ?`, [
-                    addValues(current[effect.field!], effect.delta),
+                    addValues(current[effect.field!], landed(entity, effect.field!, effect.delta, effect.basis, current)),
                     to,
                 ]);
             }
@@ -1412,6 +1449,7 @@ function resolveSpecs(
             references: new Map(Object.entries(entity.references ?? {})),
             operations,
             counterFields: new Set(),
+            convert: entity.convert,
             scope:
                 entity.scope ??
                 ((values) => {
