@@ -57,11 +57,14 @@ export function setup({
     ids = [],
     onListenerError,
     convert,
+    builtOn,
 }: {
     ids?: string[];
     onListenerError?: (error: unknown) => void;
     /** The stock's `convert`; a recorded movement then counts its delta in its `unit`. */
     convert?: EntitySpec["convert"];
+    /** items.builtOn, such as ["room_id"]. */
+    builtOn?: string[];
 } = {}) {
     const db = memoryDatabase();
     migrate(db, testMigrations);
@@ -74,7 +77,7 @@ export function setup({
         entities: {
             scopes: { scope: (values) => values.sync_id as string },
             // items.room_id is nullable: an optional link. parts.item_id is NOT NULL: a required one.
-            items: { references: { room_id: "rooms" }, serverOwned: ["illustration"] },
+            items: { references: { room_id: "rooms" }, serverOwned: ["illustration"], ...(builtOn ? { builtOn } : {}) },
             parts: { references: { item_id: "items" } },
             counters: { operations: { adjust: { counters: [{ field: "quantity", delta: "delta" }] } } },
             movements: {

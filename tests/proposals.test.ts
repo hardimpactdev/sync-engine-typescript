@@ -408,3 +408,37 @@ test("a proposed row whose own change fails passes to the next waiting change wi
     applyAcks(store, scope, [{ change_id: purchase.change_id, status: "applied", seq: 6, made: { stock: butter } }]);
     assert.equal(store.isProvisional("stock", butter), false);
 });
+
+test("a result built on another change's row that did not come true goes whole", () => {
+    const { store } = setup({ builtOn: ["room_id"] });
+    pulled(store, "items", cake, { name: "Cake", notes: null, room_id: null }, 1);
+    pulled(store, "stock", "01JBC59ZQ0B2D4F6H8K0M2P4R6", { name: "Flour", quantity: "5.000" }, 2);
+    const tally = "01JBC59ZQ0B2D4F6H8K0M2P4V5";
+    pulled(store, "counters", tally, { name: "Bakes", quantity: 0 }, 3);
+    noteFeatures(store, scope, ["proposals"]);
+    const room = bake(store);
+    const [first] = takeBatch(store, scope);
+    // A later change, computed from the bake's room: a tin in it, and flour it takes.
+    let tin = "";
+    store.update(
+        "counters",
+        tally,
+        { name: "Bakes today" },
+        {
+            provisional: (local) => {
+                tin = local.insert("items", { scope_id: scope, name: "Tin", room_id: room });
+                local.add("stock", "01JBC59ZQ0B2D4F6H8K0M2P4R6", "quantity", "-1.000");
+            },
+        },
+    );
+
+    applyAcks(store, scope, [
+        { change_id: first.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null, room_id: null } },
+    ]);
+
+    // The bake's room never came true, so the tin and the flour it took go; the change waits.
+    assert.equal(store.get("SELECT 1 FROM items WHERE sync_id = ?", [tin]), null);
+    assert.equal(store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE name = 'Flour'")?.quantity, "5.000");
+    assert.deepEqual(outbox(store).map((entry) => entry.entity), ["counters"]);
+    assert.equal(provisional(store), 0);
+});

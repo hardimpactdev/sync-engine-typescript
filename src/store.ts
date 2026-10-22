@@ -184,6 +184,7 @@ type Spec = {
     counterFields: Set<string>;
     scope: NonNullable<EntitySpec["scope"]>;
     convert: EntitySpec["convert"];
+    builtOn: Set<string>;
 };
 
 /** A counter of one queued operation that lands on a row. */
@@ -1102,7 +1103,7 @@ function createEngine<T extends string>(
      * The dependents are found before the row goes, since an entity's scope resolver may
      * read that row.
      */
-    type Dependent = { effect: ProvisionalEffect; clear: string[]; goes: boolean };
+    type Dependent = { effect: ProvisionalEffect; clear: string[]; goes: boolean; builtOn: boolean };
 
     function provisionalDependents(entity: string, rowId: string): Dependent[] {
         if (!hasProvisional()) return [];
@@ -1113,9 +1114,15 @@ function createEngine<T extends string>(
             const source = specs.get(effect.entity);
             const child = row(effect.entity, effect.row_id);
             if (!source || !child || (effect.entity === entity && effect.row_id === rowId)) continue;
-            const dependent: Dependent = { effect, clear: [], goes: source.scope(child, db) === rowId };
+            const dependent: Dependent = {
+                effect,
+                clear: [],
+                goes: source.scope(child, db) === rowId,
+                builtOn: false,
+            };
             for (const [field, pointsAt] of source.references) {
                 if (dependent.goes || pointsAt !== entity || child[field] !== rowId) continue;
+                if (source.builtOn.has(field)) dependent.builtOn = true;
                 if (optional(effect.entity, field)) dependent.clear.push(field);
                 else dependent.goes = true;
             }
@@ -1130,6 +1137,11 @@ function createEngine<T extends string>(
             entity,
             rowId,
         ]);
+        // A result computed from the row that went, such as a reversal of its purchase,
+        // goes whole; its change still waits for the server's answer.
+        for (const change of new Set(dependents.filter((dependent) => dependent.builtOn).map((dependent) => dependent.effect.change_id))) {
+            settleProvisional(change);
+        }
         for (const { effect, clear, goes } of dependents) {
             if (!row(effect.entity, effect.row_id)) continue;
             if (goes) {
@@ -1493,6 +1505,7 @@ function resolveSpecs(
             operations,
             counterFields: new Set(),
             convert: entity.convert,
+            builtOn: new Set(entity.builtOn ?? []),
             scope:
                 entity.scope ??
                 ((values) => {

@@ -44,4 +44,11 @@ export type EntitySpec = {
      * on the server or the delta moved to another row.
      */
     convert?: (field: string, delta: SqlValue, basis: string, row: Row) => SqlValue;
+    /**
+     * Reference fields whose row a provisional result was computed from, such as the
+     * purchase a reversal takes back. When that row goes as a provisional result that did
+     * not come true, the whole result of the change that points at it goes too; its
+     * change still waits for the server's answer.
+     */
+    builtOn?: readonly string[];
 };
