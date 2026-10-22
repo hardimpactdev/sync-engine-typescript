@@ -824,6 +824,46 @@ function createEngine<T extends string>(
         touch("sync_outbox");
     }
 
+    /**
+     * A proposed row whose own change failed (refused, or the server did not make it). When
+     * a later change that the server has not seen yet has a result on it, the row passes to
+     * that change: the change proposes it under the same key, so the server makes it, or
+     * names the row it used, when it runs that change. Its counters restart from the results
+     * that stay, since the failed change's own prediction is gone. Otherwise the row goes,
+     * with the unsent changes that need it.
+     */
+    function releaseProposed(entity: string, rowId: string, key: string) {
+        const deltas = provisionalOn(entity, rowId);
+        const heir = deltas
+            .map((effect) => db.get<OutboxEntry>("SELECT * FROM sync_outbox WHERE change_id = ?", [effect.change_id]))
+            .filter((entry): entry is OutboxEntry => entry !== null && unsent(entry))
+            .sort((a, b) => a.position - b.position)[0];
+        const taken = heir ? (JSON.parse(heir.proposals ?? "{}") as Record<string, string>)[key] : undefined;
+        if (!heir || taken !== undefined) {
+            cancel(entity, rowId);
+            return;
+        }
+        const current = row(entity, rowId)!;
+        const restart: Row = {};
+        for (const effect of deltas) {
+            const field = effect.field!;
+            restart[field] = addValues(restart[field] ?? "0", landed(entity, field, effect.delta, effect.basis, current));
+        }
+        for (const [field, value] of Object.entries(restart)) {
+            db.run(`UPDATE ${entity} SET ${field} = ? WHERE sync_id = ?`, [value, rowId]);
+        }
+        db.run(
+            "INSERT INTO sync_provisional (change_id, scope_id, entity, row_id, field, delta, proposal) VALUES (?, ?, ?, ?, NULL, NULL, ?)",
+            [heir.change_id, heir.scope_id, entity, rowId, key],
+        );
+        db.run("UPDATE sync_outbox SET proposals = ? WHERE change_id = ?", [
+            JSON.stringify({ ...(JSON.parse(heir.proposals ?? "{}") as Record<string, string>), [key]: rowId }),
+            heir.change_id,
+        ]);
+        touch(entity);
+        touch("sync_outbox");
+    }
+
     function isProposedRow(entity: string, rowId: string): boolean {
         return (
             hasProposals() &&
@@ -853,7 +893,7 @@ function createEngine<T extends string>(
             const to = made?.[key];
             db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
             if (to === undefined) {
-                if (row(effect.entity, proposed)) cancel(effect.entity, proposed);
+                if (row(effect.entity, proposed)) releaseProposed(effect.entity, proposed, key);
                 continue;
             }
             if (to !== proposed) remap(effect.entity, proposed, to);
@@ -922,7 +962,7 @@ function createEngine<T extends string>(
             if (!current) continue;
             if (effect.field === null) {
                 // A proposed row takes the unsent changes made to it along.
-                if (effect.proposal) cancel(effect.entity, effect.row_id);
+                if (effect.proposal) releaseProposed(effect.entity, effect.row_id, effect.proposal);
                 else deleteWithProvisional(effect.entity, effect.row_id);
                 continue;
             }

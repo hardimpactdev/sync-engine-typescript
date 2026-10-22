@@ -379,3 +379,32 @@ test("an action keeps its place after the changes its result builds on", () => {
         ],
     );
 });
+
+test("a proposed row whose own change fails passes to the next waiting change with a result on it", () => {
+    const { store } = kitchen();
+    const tally = "01JBC59ZQ0B2D4F6H8K0M2P4V4";
+    pulled(store, "counters", tally, { name: "Bakes", quantity: 0 }, 2);
+    let butter = "";
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        { provisional: (local) => void (butter = local.insert("stock", { scope_id: scope, name: "Butter", quantity: "5.000" }, { key: "stock" })) },
+    );
+    const [bake] = takeBatch(store, scope);
+    // A second purchase of butter waits; its result lands on the butter the bake makes.
+    store.update("counters", tally, { name: "Bakes today" }, { provisional: (local) => local.add("stock", butter, "quantity", "2.000") });
+
+    applyAcks(store, scope, [
+        { change_id: bake.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null, room_id: null } },
+    ]);
+
+    // The butter stays, with only the second purchase on it, and that change now proposes it.
+    assert.equal(store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [butter])?.quantity, "2.000");
+    assert.equal(store.isProposed("stock", butter), true);
+    const [purchase] = takeBatch(store, scope);
+    assert.deepEqual(purchase.proposals, { stock: butter });
+
+    applyAcks(store, scope, [{ change_id: purchase.change_id, status: "applied", seq: 6, made: { stock: butter } }]);
+    assert.equal(store.isProvisional("stock", butter), false);
+});
