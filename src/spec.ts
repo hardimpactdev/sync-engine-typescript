@@ -32,4 +32,11 @@ export type EntitySpec = {
     operations?: Readonly<Record<string, OperationSpec>>;
     /** The scope's sync_id for a row. Default: the row's scope column (`scope_id`). */
     scope?: (row: Row, db: Pick<SqlDatabase, "get" | "all">) => string | null;
+    /**
+     * The server's row that took the place of a provisional row of this entity, read after
+     * the pull that settles the change that made it. Results of changes still waiting that
+     * build on the provisional row move onto it. Without one, the provisional row stays
+     * until those changes are answered too.
+     */
+    successor?: (row: Row, db: Pick<SqlDatabase, "get" | "all">) => string | null;
 };

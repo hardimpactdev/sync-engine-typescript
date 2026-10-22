@@ -164,6 +164,7 @@ type Spec = {
     operations: Map<string, { counters: readonly CounterSpec[]; references: Map<string, string> }>;
     counterFields: Set<string>;
     scope: NonNullable<EntitySpec["scope"]>;
+    successor: EntitySpec["successor"];
 };
 
 /** A counter of one queued operation that lands on a row. */
@@ -757,7 +758,17 @@ function createEngine<T extends string>(
                       "SELECT * FROM sync_provisional WHERE scope_id IN (?, ?) AND acked = 1 ORDER BY id DESC",
                       [scopeId!, scopeAlias(scopeId!)],
                   );
+        // An applied change's rows give way to the server's. The results of changes still
+        // waiting that build on one of them must not go with it (handOver).
+        const kept = new Set<number>();
+        if (changeId === null) {
+            const settling = new Set(effects.map((effect) => effect.change_id));
+            for (const effect of effects) {
+                if (effect.field === null && handOver(effect, settling)) kept.add(effect.id);
+            }
+        }
         for (const effect of effects) {
+            if (kept.has(effect.id)) continue;
             db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
             const current = row(effect.entity, effect.row_id);
             if (!current) continue;
@@ -771,6 +782,71 @@ function createEngine<T extends string>(
             ]);
             touch(effect.entity);
         }
+    }
+
+    /**
+     * A provisional row of an applied change is about to go, while changes the server has
+     * not answered yet built on it: a delta on it, or a provisional row that points at it.
+     * Their results move onto the server's row that took its place (the entity's
+     * `successor`), so the device keeps showing them. Without that row, the provisional row
+     * passes to the earliest waiting change and goes when that one settles. Returns
+     * whether the row stays.
+     */
+    function handOver(effect: ProvisionalEffect, settling: Set<string>): boolean {
+        const { entity, row_id: rowId } = effect;
+        const current = row(entity, rowId);
+        if (!current) return false;
+        const deltas = provisionalOn(entity, rowId).filter((other) => !settling.has(other.change_id));
+        const links: { effect: ProvisionalEffect; fields: string[] }[] = [];
+        const scoped: ProvisionalEffect[] = [];
+        for (const other of db.all<ProvisionalEffect>(
+            "SELECT * FROM sync_provisional WHERE field IS NULL ORDER BY id",
+        )) {
+            if (settling.has(other.change_id)) continue;
+            const source = specs.get(other.entity);
+            const child = row(other.entity, other.row_id);
+            if (!source || !child) continue;
+            if (source.scope(child, db) === rowId) scoped.push(other);
+            const fields = [...source.references]
+                .filter(([field, pointsAt]) => pointsAt === entity && child[field] === rowId)
+                .map(([field]) => field);
+            if (fields.length > 0) links.push({ effect: other, fields });
+        }
+        if (deltas.length === 0 && links.length === 0 && scoped.length === 0) return false;
+
+        // A row in its scope cannot move to another scope; it keeps the provisional row.
+        const found = scoped.length > 0 ? null : (specs.get(entity)?.successor?.(current, db) ?? null);
+        const successor =
+            found !== null && found !== rowId && !isProvisionalRow(entity, found) ? row(entity, found) : null;
+        if (successor && successor.deleted_at === null) {
+            const to = String(successor.sync_id);
+            for (const delta of deltas) {
+                const target = row(entity, to)!;
+                db.run(`UPDATE ${entity} SET ${delta.field} = ? WHERE sync_id = ?`, [
+                    addValues(target[delta.field!], delta.delta),
+                    to,
+                ]);
+                db.run("UPDATE sync_provisional SET row_id = ? WHERE id = ?", [to, delta.id]);
+            }
+            for (const { effect: other, fields } of links) {
+                for (const field of fields) {
+                    db.run(`UPDATE ${other.entity} SET ${field} = ? WHERE sync_id = ?`, [to, other.row_id]);
+                }
+                touch(other.entity);
+            }
+            touch(entity);
+            return false;
+        }
+
+        const heir = [...deltas, ...links.map((link) => link.effect), ...scoped].sort(
+            (a, b) => a.id - b.id,
+        )[0];
+        db.run("UPDATE sync_provisional SET change_id = ?, acked = ? WHERE id = ?", [
+            heir.change_id,
+            heir.acked,
+            effect.id,
+        ]);
+        return true;
     }
 
     /**
@@ -1268,6 +1344,7 @@ function resolveSpecs(
             references: new Map(Object.entries(entity.references ?? {})),
             operations,
             counterFields: new Set(),
+            successor: entity.successor,
             scope:
                 entity.scope ??
                 ((values) => {
