@@ -144,35 +144,19 @@ never saw is kept the same way when a new row that needs it carries an action.
 
 A provisional row is read-only for the outbox. A write to it, a reference to it
 or a row in it as a scope throws a `ProvisionalRowError`;
-`store.isProvisional(table, id)` tells the app before. A later provisional
-result may build on it, as the server's result builds on the server's own row:
-`add` puts a delta on it, and `insert` may point at it. Unchecking a purchase
-that made a new item, before the server's item arrives, takes its stock back
-this way.
+`store.isProvisional(table, id)` tells the app before. A delta on it is allowed
+only within the change that made it. Another change may not put its result on
+it: the row goes when its own change is answered, and the server's row that
+takes its place may hold other units and amounts. Such a change, such as
+unchecking a purchase that made a new item before the server's item arrived,
+applies to the row the user touched and queues without a result; its effect
+shows with the pull.
 
-A result is a prediction: what the change will do, computed on the server's
-rows and on the results of the changes before it in the outbox. When that
-ground moves (a drained pull, a refused change, a settled or dropped change),
-the store computes every waiting result again: it takes the old ones back, then
-calls the writer the app's `rederive` returns for each change, in outbox order,
-on the rows there are now. A result built on another change's provisional row
-is then written on the server's row once that one has arrived, in its unit and
-amounts, and never left on a row that is gone. `rederive` returns null for a
-change whose result the app does not compute; that change keeps its result.
-Without `rederive`, building on another change's provisional row throws a
-`ProvisionalRowError`.
-
-```ts
-createLocalStore(db, {
-    // ...
-    rederive: (change) =>
-        change.entity === "shopping_items" && "purchased" in change.payload
-            ? (local) => writePurchase(local, change.rowId, change.payload.purchased)
-            : null,
-});
-```
-
-Whenever a row goes, by a remove, a pulled tombstone, an acked delete, a refused insert, a resync sweep or
+An export that must not count a prediction as data, such as copying a household
+into another account, reads rows with `store.withoutProvisional(table, id)`:
+null for a provisional row, else the row with provisional deltas taken off.
+Unsent changes stay in it: they are the user's own. Whenever a row goes, by a
+remove, a pulled tombstone, an acked delete, a refused insert, a resync sweep or
 a purge, the provisional rows that need it follow as through a foreign key: an
 optional link is cleared, a required link takes the provisional row along.
 This needs `syncEngineSchemaV2`, a later migration step than

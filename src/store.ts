@@ -21,20 +21,7 @@ export type StoreOptions<T extends string> = {
     now?: () => string;
     /** Gets an error a listener threw after a commit. By default it is thrown again in a microtask. */
     onListenerError?: (error: unknown) => void;
-    /**
-     * Computes a waiting change's provisional result again. Return the writer for a change
-     * whose result the app computes (an action), or null for any other. Results are a
-     * prediction on top of the server's rows, in outbox order, so the store computes them
-     * all again when that ground moves: after a pull, a refusal or a settled change. It
-     * takes the old results back first, then calls each writer in outbox order on the
-     * rows there are now. An app needs it to build a result on another change's
-     * provisional row.
-     */
-    rederive?: (change: QueuedChange) => ((local: ProvisionalWriter) => void) | null;
 };
-
-/** A change waiting in the outbox, as `rederive` gets it. */
-export type QueuedChange = { entity: string; rowId: string; op: string; payload: Row };
 
 export type WriteOptions = {
     /** Local file ids that must upload before this change is sent. */
@@ -66,8 +53,7 @@ export type ProvisionalWriter = {
     insert(table: string, values: Row): string;
     /**
      * Adds a delta to a counter: a field that an operation's counters change, such as stock.
-     * The row may be provisional itself, made by an earlier change: the delta builds on that
-     * result, and goes when the row goes.
+     * The row may be a provisional row of the same change, never of another one.
      */
     add(table: string, syncId: string, field: string, delta: SqlValue): void;
 };
@@ -109,6 +95,13 @@ export interface LocalStore<T extends string = string> {
     ): void;
     /** Whether a row is provisional: made only here, until the server's result replaces it. */
     isProvisional(table: T, syncId: string): boolean;
+    /**
+     * A row as the server's rows and this device's unsent changes have it, without any
+     * provisional result: null for a provisional row, else its values with provisional
+     * deltas taken off. For an export, such as copying a household into another account,
+     * which must not count a prediction as data.
+     */
+    withoutProvisional(table: T, syncId: string): Row | null;
     subscribe(tables: readonly (T | EngineTable)[], listener: () => void): () => void;
     /** Changes whenever one of the tables changes, for useSyncExternalStore. */
     version(tables: readonly (T | EngineTable)[]): string;
@@ -310,6 +303,17 @@ export function createLocalStore<T extends string>(
 
         isProvisional: (table, syncId) => engine.isProvisionalRow(table, syncId),
 
+        withoutProvisional(table, syncId) {
+            spec(table);
+            const current = engine.row(table, syncId);
+            if (!current || engine.isProvisionalRow(table, syncId)) return null;
+            const values: Row = { ...current };
+            for (const effect of engine.provisionalOn(table, syncId)) {
+                values[effect.field!] = addValues(values[effect.field!], negate(effect.delta));
+            }
+            return values;
+        },
+
         subscribe(tables, listener) {
             for (const table of tables) {
                 if (!engine.listeners.has(table)) engine.listeners.set(table, new Set());
@@ -336,7 +340,6 @@ function createEngine<T extends string>(
         newId,
         now = () => new Date().toISOString(),
         onListenerError = rethrowLater,
-        rederive,
     }: StoreOptions<T>,
 ) {
     if (!plainName.test(scopeColumn)) throw new Error(`${scopeColumn} is not a column name.`);
@@ -678,17 +681,14 @@ function createEngine<T extends string>(
             get: (sql, params = []) => db.get(sql, params),
             all: (sql, params = []) => db.all(sql, params),
             insert(table, values) {
-                const entity = spec(table);
+                spec(table);
                 for (const column of Object.keys(values)) {
                     if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
                     if (conventions.has(column) && column !== scopeColumn) {
                         throw new Error(`The store sets ${column} itself.`);
                     }
                 }
-                for (const [field, target] of entity.references) {
-                    const value = values[field];
-                    if (typeof value === "string") guardOthers(target, value, entry.change_id);
-                }
+
                 const syncId = newId();
                 const stamp = now();
                 const names = ["sync_id", ...Object.keys(values), "created_at", "updated_at"];
@@ -708,9 +708,8 @@ function createEngine<T extends string>(
                 }
                 const current = row(table, syncId);
                 if (!current || current.deleted_at !== null) throw new MissingRowError(table, syncId);
+                // A provisional row of the same change may take the delta: they go together.
                 guardOthers(table, syncId, entry.change_id);
-                // A provisional row may take the delta: neither reaches the server. The delta
-                // goes with its own change, or is written again when the row goes first.
                 db.run(`UPDATE ${table} SET ${field} = ? WHERE sync_id = ?`, [
                     addValues(current[field], delta),
                     syncId,
@@ -727,6 +726,19 @@ function createEngine<T extends string>(
             "SELECT * FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NOT NULL ORDER BY id",
             [entity, rowId],
         );
+    }
+
+    /**
+     * Refuses a delta on a provisional row of another change. That row goes when its own
+     * change is answered, which the delta would not survive, and the server's own row may
+     * hold other units and amounts. Such an action shows its result after the pull instead.
+     */
+    function guardOthers(entity: string, rowId: string, changeId: string) {
+        const owner = db.get<{ change_id: string }>(
+            "SELECT change_id FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NULL",
+            [entity, rowId],
+        );
+        if (owner && owner.change_id !== changeId) throw new ProvisionalRowError(entity, rowId);
     }
 
     function isProvisionalRow(entity: string, rowId: string): boolean {
@@ -762,29 +774,10 @@ function createEngine<T extends string>(
         if (found) throw new ProvisionalRowError(found.entity, scopeId);
     }
 
-    /**
-     * A result on a provisional row of another change is computed from that row, which goes
-     * when its change is answered. Only an app that can compute the result again builds it.
-     */
-    function guardOthers(entity: string, rowId: string, changeId: string) {
-        if (rederive || !hasProvisional()) return;
-        const owner = db.get<{ change_id: string }>(
-            "SELECT change_id FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NULL",
-            [entity, rowId],
-        );
-        if (owner && owner.change_id !== changeId) throw new ProvisionalRowError(entity, rowId);
-    }
-
-    /**
-     * Removes provisional results: of one change, or of the changes the server applied in a
-     * scope. With `rederive`, the waiting changes' results are computed again on what is
-     * left (rederiveWaiting); `again` false leaves them, for a purge or a refusal that
-     * restores its row first.
-     */
+    /** Removes provisional results: of one change, or of the changes the server applied in a scope. */
     function settleProvisional(changeId: string): void;
     function settleProvisional(changeId: null, scopeId: string): void;
-    function settleProvisional(changeId: string, scopeId: undefined, again: boolean): void;
-    function settleProvisional(changeId: string | null, scopeId?: string, again = true) {
+    function settleProvisional(changeId: string | null, scopeId?: string) {
         if (!hasProvisional()) return;
         const effects =
             changeId !== null
@@ -795,50 +788,6 @@ function createEngine<T extends string>(
                       "SELECT * FROM sync_provisional WHERE scope_id IN (?, ?) AND acked = 1 ORDER BY id DESC",
                       [scopeId!, scopeAlias(scopeId!)],
                   );
-        const scope = scopeId ?? effects[0]?.scope_id;
-        if (!again || !rederive || scope === undefined) {
-            removeEffects(effects);
-            return;
-        }
-        rederiveWaiting(scope, () => removeEffects(effects), changeId);
-    }
-
-    /**
-     * Computes the results of the scope's waiting changes again: takes them back, lets
-     * `between` change the ground, then writes each one again in outbox order. Only the
-     * changes `rederive` computes; another change keeps its result.
-     */
-    function rederiveWaiting(scopeId: string, between: () => void = () => {}, except: string | null = null) {
-        const writers: { entry: OutboxEntry; write: (local: ProvisionalWriter) => void }[] = [];
-        for (const entry of db.all<OutboxEntry>(
-            "SELECT * FROM sync_outbox WHERE scope_id IN (?, ?) ORDER BY position",
-            [scopeId, scopeAlias(scopeId)],
-        )) {
-            if (entry.change_id === except) continue;
-            const write = rederive?.({
-                entity: entry.entity,
-                rowId: entry.row_id,
-                op: entry.op,
-                payload: JSON.parse(entry.payload) as Row,
-            });
-            if (write) writers.push({ entry, write });
-        }
-        for (const { entry } of [...writers].reverse()) {
-            removeEffects(
-                db.all<ProvisionalEffect>("SELECT * FROM sync_provisional WHERE change_id = ? ORDER BY id DESC", [
-                    entry.change_id,
-                ]),
-            );
-        }
-        between();
-        for (const { entry, write } of writers) {
-            // An earlier writer, or `between`, may have cancelled the change.
-            const current = db.get<OutboxEntry>("SELECT * FROM sync_outbox WHERE change_id = ?", [entry.change_id]);
-            if (current) writeProvisional(current, write);
-        }
-    }
-
-    function removeEffects(effects: ProvisionalEffect[]) {
         for (const effect of effects) {
             db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
             const current = row(effect.entity, effect.row_id);
@@ -865,7 +814,7 @@ function createEngine<T extends string>(
             "SELECT DISTINCT change_id FROM sync_provisional WHERE scope_id IN (?, ?)",
             [scopeId, scopeAlias(scopeId)],
         );
-        for (const { change_id } of changes) settleProvisional(change_id, undefined, false);
+        for (const { change_id } of changes) settleProvisional(change_id);
     }
 
     /** The scope a remapped scope became, so a client that still uses the old id settles its results. */
@@ -1309,11 +1258,11 @@ function createEngine<T extends string>(
         hasProvisional,
         writeProvisional,
         isProvisionalRow,
+        provisionalOn,
         guardRow,
         guardReferences,
         guardScope,
         settleProvisional,
-        rederiveWaiting,
         discardProvisional,
         ackProvisional,
         carriesProvisional,

@@ -28,7 +28,6 @@ export {
     type LocalWriter,
     type OutboxEntry,
     type ProvisionalWriter,
-    type QueuedChange,
     type StoreOptions,
     type WriteOptions,
 } from "./store.ts";
