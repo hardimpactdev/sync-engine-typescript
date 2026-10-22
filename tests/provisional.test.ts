@@ -544,25 +544,17 @@ test("both results settle after the server ran both changes", () => {
     assert.equal(provisional(store), 0);
 });
 
-// The server's stock row for a provisional one: the pulled row of the same name.
-const sameName: Parameters<typeof setup>[0] = {
-    successors: {
-        stock: (row, db) =>
-            db.get<{ sync_id: string }>("SELECT sync_id FROM stock WHERE name = ? AND server_seq IS NOT NULL", [row.name])
-                ?.sync_id ?? null,
-        rooms: (row, db) =>
-            db.get<{ sync_id: string }>("SELECT sync_id FROM rooms WHERE name = ? AND server_seq IS NOT NULL", [row.name])
-                ?.sync_id ?? null,
-    },
-};
 const serverButter = "01JBC59ZQ0B2D4F6H8K0M2P4T1";
 
-/** The server ran only the bake: its butter arrives, with the use still waiting. */
-function serverRunsOnlyTheBake(store: Store) {
+/**
+ * The server ran only the bake: its butter arrives, with the use still waiting. Its row may
+ * hold another amount or unit than the device's, such as an item the server already had.
+ */
+function serverRunsOnlyTheBake(store: Store, quantity = "5.000") {
     const [bake] = takeBatch(store, scope);
     applyAcks(store, scope, [{ change_id: bake.change_id, status: "applied", seq: 4 }]);
     applyPullPage(store, scope, {
-        changes: [{ entity: "stock", id: serverButter, seq: 4, op: "upsert", row: { name: "Butter", quantity: "5.000" } }],
+        changes: [{ entity: "stock", id: serverButter, seq: 4, op: "upsert", row: { name: "Butter", quantity } }],
         cursor: "c4",
         has_more: false,
     });
@@ -576,54 +568,74 @@ function stockRows(store: Store) {
         .map(({ sync_id, quantity }) => ({ sync_id, quantity }));
 }
 
-test("a waiting result on a provisional row moves to the server's row when the first change settles", () => {
-    const { store, db } = kitchen(sameName);
-    const { butter } = bakeThenUse(store);
+/** Answers what waits as applied, with nothing more from the server. */
+function serverRunsTheRest(store: Store, seq: number) {
+    const waiting = store.all<{ change_id: string }>("SELECT change_id FROM sync_outbox ORDER BY position");
+    applyAcks(
+        store,
+        scope,
+        waiting.map((change, index) => ({ change_id: change.change_id, status: "applied", seq: seq + index })),
+    );
+    applyPullPage(store, scope, { changes: [], cursor: `c${seq}`, has_more: false });
+}
 
-    serverRunsOnlyTheBake(store);
-
-    // The use is not answered yet: the server's butter shows it, and the device's is gone.
-    assert.deepEqual(stockRows(store), [{ sync_id: serverButter, quantity: "3.000" }]);
-    assert.equal(store.get("SELECT 1 FROM stock WHERE sync_id = ?", [butter]), null);
-
-    // It is stored, so a restart shows the same.
-    const reopened = setup({ ...sameName, db }).store;
-    assert.deepEqual(stockRows(reopened), [{ sync_id: serverButter, quantity: "3.000" }]);
-
-    // The server runs the use; its row holds it, and nothing provisional is left.
-    const [use] = takeBatch(reopened, scope);
-    applyAcks(reopened, scope, [{ change_id: use.change_id, status: "applied", seq: 5 }]);
-    applyPullPage(reopened, scope, {
-        changes: [{ entity: "stock", id: serverButter, seq: 5, op: "upsert", row: { name: "Butter", quantity: "3.000" } }],
-        cursor: "c5",
-        has_more: false,
-    });
-    assert.deepEqual(stockRows(reopened), [{ sync_id: serverButter, quantity: "3.000" }]);
-    assert.equal(provisional(reopened), 0);
-});
-
-test("without the server's row, a provisional row stays until the result on it settles", () => {
+test("a provisional row stays beside the server's row while a later result on it waits", () => {
     const { store, db } = kitchen();
     const { butter } = bakeThenUse(store);
 
-    serverRunsOnlyTheBake(store);
-
-    assert.deepEqual(stockRows(store), [
-        { sync_id: serverButter, quantity: "5.000" },
+    // The server's row keeps its own amount; the device never moves a result onto it.
+    serverRunsOnlyTheBake(store, "0.005");
+    const both = [
+        { sync_id: serverButter, quantity: "0.005" },
         { sync_id: butter, quantity: "3.000" },
-    ]);
+    ];
+    assert.deepEqual(stockRows(store), both);
+
+    // It is stored, so a restart shows the same.
     const reopened = setup({ db }).store;
+    assert.deepEqual(stockRows(reopened), both);
     assert.equal(reopened.isProvisional("stock", butter), true);
 
-    const [use] = takeBatch(reopened, scope);
-    applyAcks(reopened, scope, [{ change_id: use.change_id, status: "applied", seq: 5 }]);
-    applyPullPage(reopened, scope, { changes: [], cursor: "c5", has_more: false });
-    assert.deepEqual(stockRows(reopened), [{ sync_id: serverButter, quantity: "5.000" }]);
+    // The use settles: the server's rows hold the truth, and the provisional row goes.
+    serverRunsTheRest(reopened, 5);
+    assert.deepEqual(stockRows(reopened), [{ sync_id: serverButter, quantity: "0.005" }]);
     assert.equal(provisional(reopened), 0);
 });
 
-test("a waiting provisional row that points at a settled one points at the server's row", () => {
-    const { store } = kitchen(sameName);
+test("refusing one waiting result leaves the others on the kept row", () => {
+    const { store, db } = kitchen();
+    const { butter } = bakeThenUse(store);
+    const hall = "01JBC59ZQ0B2D4F6H8K0M2P4T3";
+    pulled(store, "rooms", hall, { name: "Hall" }, 3);
+    store.update(
+        "rooms",
+        hall,
+        { name: "Front hall" },
+        { provisional: (local) => local.add("stock", butter, "quantity", "-1.000") },
+    );
+
+    serverRunsOnlyTheBake(store);
+    assert.equal(stockRows(store).find((row) => row.sync_id === butter)?.quantity, "2.000");
+
+    // The use is refused: only its own delta goes. The other change still waits.
+    const use = store.get<{ change_id: string }>("SELECT change_id FROM sync_outbox WHERE entity = 'counters'")!;
+    applyAcks(store, scope, [
+        { change_id: use.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Bakes", quantity: 0 } },
+    ]);
+    assert.deepEqual(stockRows(store), [
+        { sync_id: serverButter, quantity: "5.000" },
+        { sync_id: butter, quantity: "4.000" },
+    ]);
+    assert.equal(outbox(store).length, 1);
+    assert.equal(setup({ db }).store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [butter])?.quantity, "4.000");
+
+    serverRunsTheRest(store, 6);
+    assert.deepEqual(stockRows(store), [{ sync_id: serverButter, quantity: "5.000" }]);
+    assert.equal(provisional(store), 0);
+});
+
+test("a kept row keeps the waiting rows that point at it", () => {
+    const { store } = kitchen();
     pulled(store, "counters", tally, { name: "Bakes", quantity: 0 }, 3);
     let room = "";
     let tin = "";
@@ -639,22 +651,17 @@ test("a waiting provisional row that points at a settled one points at the serve
         { name: "Bakes today" },
         { provisional: (local) => void (tin = local.insert("items", { scope_id: scope, name: "Tin", room_id: room })) },
     );
-    const serverRoom = "01JBC59ZQ0B2D4F6H8K0M2P4T2";
 
     const [bake] = takeBatch(store, scope);
     applyAcks(store, scope, [{ change_id: bake.change_id, status: "applied", seq: 4 }]);
-    applyPullPage(store, scope, {
-        changes: [{ entity: "rooms", id: serverRoom, seq: 4, op: "upsert", row: { name: "Pantry" } }],
-        cursor: "c4",
-        has_more: false,
-    });
+    applyPullPage(store, scope, { changes: [], cursor: "c4", has_more: false });
+    assert.equal(store.isProvisional("rooms", room), true);
+    assert.equal(store.get<{ room_id: string | null }>("SELECT room_id FROM items WHERE sync_id = ?", [tin])?.room_id, room);
 
+    serverRunsTheRest(store, 5);
     assert.equal(store.get("SELECT 1 FROM rooms WHERE sync_id = ?", [room]), null);
-    assert.equal(
-        store.get<{ room_id: string | null }>("SELECT room_id FROM items WHERE sync_id = ?", [tin])?.room_id,
-        serverRoom,
-    );
-    assert.equal(store.isProvisional("items", tin), true);
+    assert.equal(store.get("SELECT 1 FROM items WHERE sync_id = ?", [tin]), null);
+    assert.equal(provisional(store), 0);
 });
 
 test("provisional rows that point at a provisional row follow it when it goes", () => {

@@ -3,7 +3,6 @@ import { migrate, syncEngineSchemaV1, syncEngineSchemaV2 } from "../src/migrate.
 import { createLocalStore } from "../src/store.ts";
 import { applyPullPage } from "../src/sync.ts";
 import type { Row } from "../src/database.ts";
-import type { EntitySpec } from "../src/spec.ts";
 import { memoryDatabase } from "./memory-database.ts";
 
 // A neutral schema like the fixtures': rooms, items in rooms, counters with an
@@ -55,13 +54,10 @@ export const scope = "01J9XX0A1B2C3D4E5F6G7H8J9K";
 export function setup({
     ids = [],
     onListenerError,
-    successors = {},
     db = memoryDatabase(),
 }: {
     ids?: string[];
     onListenerError?: (error: unknown) => void;
-    /** Each entity's `successor`, for provisional results that build on a provisional row. */
-    successors?: Partial<Record<Table, EntitySpec["successor"]>>;
     /** An existing database, to open a store again as after a restart. */
     db?: ReturnType<typeof memoryDatabase>;
 } = {}) {
@@ -73,7 +69,7 @@ export function setup({
     const queue = [...ids];
     const store = createLocalStore(db, {
         tables,
-        entities: withSuccessors(successors, {
+        entities: {
             scopes: { scope: (values) => values.sync_id as string },
             // items.room_id is nullable: an optional link. parts.item_id is NOT NULL: a required one.
             items: { references: { room_id: "rooms" }, serverOwned: ["illustration"] },
@@ -87,7 +83,7 @@ export function setup({
                     },
                 },
             },
-        }),
+        },
         newId: () => queue.shift() ?? `ID${String(++id).padStart(4, "0")}`,
         now: () => fixed ?? new Date(Date.UTC(2026, 9, 20, 9, 0, clock++)).toISOString(),
         onListenerError,
@@ -105,17 +101,6 @@ export function setup({
 }
 
 export type Store = ReturnType<typeof setup>["store"];
-
-function withSuccessors(
-    successors: Partial<Record<Table, EntitySpec["successor"]>>,
-    entities: Partial<Record<Table, EntitySpec>>,
-): Partial<Record<Table, EntitySpec>> {
-    const all = { ...entities };
-    for (const [table, successor] of Object.entries(successors) as [Table, EntitySpec["successor"]][]) {
-        all[table] = { ...all[table], successor };
-    }
-    return all;
-}
 
 export type Entry = {
     entity: string;

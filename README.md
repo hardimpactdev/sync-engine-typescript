@@ -148,25 +148,11 @@ or a row in it as a scope throws a `ProvisionalRowError`;
 result may build on it, as the server's result builds on the server's own row:
 `add` puts a delta on it, and `insert` may point at it. Unchecking a purchase
 that made a new item, before the server's item arrives, takes its stock back
-this way. The delta goes with its own change. When the change that made the
-row is applied first, the row gives way to the server's, and the results still
-waiting move onto the server's row: the entity's `successor` names it.
-
-```ts
-entities: {
-    stock: {
-        // The server's row that took a provisional row's place, after the pull.
-        successor: (row, db) =>
-            db.get<{ sync_id: string }>(
-                "SELECT sync_id FROM stock WHERE name = ? AND server_seq IS NOT NULL",
-                [row.name],
-            )?.sync_id ?? null,
-    },
-},
-```
-
-Without a successor, the provisional row stays until the results on it settle
-too. A refused change still takes its row and the results on it along. Whenever a row goes, by a
+this way. A result belongs to its own change only: it goes when that change
+settles or is refused, never when another change does. When the change that
+made the row settles while a later result on it still waits, the row stays,
+beside the server's own, until that result settles too. A refused change still
+takes its row along, with the results on it: the server never made that row. Whenever a row goes, by a
 remove, a pulled tombstone, an acked delete, a refused insert, a resync sweep or
 a purge, the provisional rows that need it follow as through a foreign key: an
 optional link is cleared, a required link takes the provisional row along.
