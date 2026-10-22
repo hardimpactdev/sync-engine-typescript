@@ -262,7 +262,10 @@ export function createLocalStore<T extends string>(
                 if (Object.keys(synced).length > 0) {
                     const entry = merge
                         ? engine.append(entity, engine.row(table, syncId)!, "upsert", synced, dependsOn, true)
-                        : engine.queueUpsert(entity, engine.row(table, syncId)!, synced, dependsOn);
+                        : provisional
+                          ? // An action keeps its place: its result was computed on every change before it.
+                            engine.append(entity, engine.row(table, syncId)!, "upsert", synced, dependsOn)
+                          : engine.queueUpsert(entity, engine.row(table, syncId)!, synced, dependsOn);
                     if (provisional) engine.writeProvisional(entry, provisional);
                 }
                 touch(table);

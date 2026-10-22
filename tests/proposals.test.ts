@@ -356,3 +356,26 @@ test("a queued operation's delta lands in its row's unit, also on a row it moved
     });
     assert.equal(store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [eggs])?.quantity, "3.500");
 });
+
+test("an action keeps its place after the changes its result builds on", () => {
+    const { store } = setup();
+    const jar = store.insert("items", { scope_id: scope, name: "Jar" });
+    // A later change makes the stock the action's result lands on.
+    const flour = store.insert("stock", { scope_id: scope, name: "Flour" });
+    store.update(
+        "items",
+        jar,
+        { notes: "Filled" },
+        { provisional: (local) => local.add("stock", flour, "quantity", "1.000") },
+    );
+
+    // Merged into the jar's insert, the action would reach the server before the flour.
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.payload]),
+        [
+            ["items", { name: "Jar" }],
+            ["stock", { name: "Flour" }],
+            ["items", { notes: "Filled" }],
+        ],
+    );
+});
