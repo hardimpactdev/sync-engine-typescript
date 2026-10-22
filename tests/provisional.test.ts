@@ -451,12 +451,97 @@ test("no write path changes or points into a provisional row", () => {
         () => store.operate("counters", bakes, "adjust", { delta: 1 }, (local) => local.put("stock", stock, { name: "Ghee" })),
         ProvisionalRowError,
     );
-    assert.throws(
-        () => store.operate("counters", bakes, "adjust", { delta: 1 }, undefined, { provisional: (local) => local.add("stock", stock, "quantity", "-1.000") }),
-        ProvisionalRowError,
-    );
     assert.throws(() => store.insert("rooms", { scope_id: room, name: "Hall" }), ProvisionalRowError);
     assert.equal(outbox(store).length, 1);
+});
+
+const tally = "01JBC59ZQ0B2D4F6H8K0M2P4S2";
+
+/** Bakes the cake, which makes provisional stock, then a later change uses some of it. */
+function bakeThenUse(store: Store) {
+    pulled(store, "counters", tally, { name: "Bakes", quantity: 0 }, 3);
+    let butter = "";
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        { provisional: (local) => void (butter = local.insert("stock", { scope_id: scope, name: "Butter", quantity: "5.000" })) },
+    );
+    store.update(
+        "counters",
+        tally,
+        { name: "Bakes today" },
+        {
+            provisional: (local) => {
+                local.insert("movements", { scope_id: scope, stock_id: butter, delta: "-2.000" });
+                local.add("stock", butter, "quantity", "-2.000");
+            },
+        },
+    );
+    const butterQuantity = () =>
+        store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [butter])?.quantity;
+    return { butter, butterQuantity };
+}
+
+test("a later provisional result builds on a provisional row", () => {
+    const { store } = kitchen();
+    const { butterQuantity } = bakeThenUse(store);
+
+    assert.equal(butterQuantity(), "3.000");
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.op]),
+        [
+            ["items", "upsert"],
+            ["counters", "upsert"],
+        ],
+    );
+
+    // Its own change refused: only its delta goes.
+    const [, use] = takeBatch(store, scope);
+    applyAcks(store, scope, [
+        { change_id: use.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Bakes", quantity: 0 } },
+    ]);
+    assert.equal(butterQuantity(), "5.000");
+    assert.equal(provisional(store), 1);
+});
+
+test("a delta on a provisional row goes with the row", () => {
+    const { store } = kitchen();
+    const { butter } = bakeThenUse(store);
+
+    const [bake, use] = takeBatch(store, scope);
+    applyAcks(store, scope, [
+        { change_id: bake.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Cake", notes: null } },
+    ]);
+    assert.equal(store.get("SELECT 1 FROM stock WHERE sync_id = ?", [butter]), null);
+    // The later movement stays until its own change settles.
+    assert.deepEqual(movements(store).map((row) => row.delta), ["-2.000"]);
+
+    applyAcks(store, scope, [{ change_id: use.change_id, status: "applied", seq: 4 }]);
+    applyPullPage(store, scope, { changes: [], cursor: "c4", has_more: false });
+    assert.equal(movements(store).length, 0);
+    assert.equal(provisional(store), 0);
+});
+
+test("both results settle after the server ran both changes", () => {
+    const { store } = kitchen();
+    const { butter } = bakeThenUse(store);
+
+    const [bake, use] = takeBatch(store, scope);
+    applyAcks(store, scope, [
+        { change_id: bake.change_id, status: "applied", seq: 4 },
+        { change_id: use.change_id, status: "applied", seq: 5 },
+    ]);
+    applyPullPage(store, scope, {
+        changes: [{ entity: "stock", id: serverMovement, seq: 6, op: "upsert", row: { name: "Butter", quantity: "3.000" } }],
+        cursor: "c6",
+        has_more: false,
+    });
+
+    assert.equal(store.get("SELECT 1 FROM stock WHERE sync_id = ?", [butter]), null);
+    assert.equal(store.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [serverMovement])?.quantity, "3.000");
+    assert.equal(movements(store).length, 0);
+    assert.equal(provisional(store), 0);
 });
 
 test("provisional rows that point at a provisional row follow it when it goes", () => {

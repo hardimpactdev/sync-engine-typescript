@@ -142,9 +142,14 @@ row: the action, with the changes it builds on, goes before the delete, so the
 server runs it once and nothing is taken back or counted twice. A row the server
 never saw is kept the same way when a new row that needs it carries an action.
 
-A provisional row is read-only. A write to it, a delta on it, a reference to it
+A provisional row is read-only for the outbox. A write to it, a reference to it
 or a row in it as a scope throws a `ProvisionalRowError`;
-`store.isProvisional(table, id)` tells the app before. Whenever a row goes, by a
+`store.isProvisional(table, id)` tells the app before. A later provisional
+result may build on it, as the server's result builds on the server's own row:
+`add` puts a delta on it, and `insert` may point at it. Unchecking a purchase
+that made a new item, before the server's item arrives, takes its stock back
+this way. The delta goes with its own change, or with the row when the row
+goes first. Whenever a row goes, by a
 remove, a pulled tombstone, an acked delete, a refused insert, a resync sweep or
 a purge, the provisional rows that need it follow as through a foreign key: an
 optional link is cleared, a required link takes the provisional row along.
