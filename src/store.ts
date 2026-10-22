@@ -21,7 +21,18 @@ export type StoreOptions<T extends string> = {
     now?: () => string;
     /** Gets an error a listener threw after a commit. By default it is thrown again in a microtask. */
     onListenerError?: (error: unknown) => void;
+    /**
+     * Writes a waiting change's provisional result again. The store calls it when rows the
+     * result was built on go, such as another change's provisional row once the server's
+     * own arrived, after it took the old result back. It writes what the change does on
+     * the rows there are now, as when the user made it. An app needs it to build a result
+     * on another change's provisional row.
+     */
+    rederive?: (change: QueuedChange, local: ProvisionalWriter) => void;
 };
+
+/** A change waiting in the outbox, as `rederive` gets it. */
+export type QueuedChange = { entity: string; rowId: string; op: string; payload: Row };
 
 export type WriteOptions = {
     /** Local file ids that must upload before this change is sent. */
@@ -323,6 +334,7 @@ function createEngine<T extends string>(
         newId,
         now = () => new Date().toISOString(),
         onListenerError = rethrowLater,
+        rederive,
     }: StoreOptions<T>,
 ) {
     if (!plainName.test(scopeColumn)) throw new Error(`${scopeColumn} is not a column name.`);
@@ -664,12 +676,16 @@ function createEngine<T extends string>(
             get: (sql, params = []) => db.get(sql, params),
             all: (sql, params = []) => db.all(sql, params),
             insert(table, values) {
-                spec(table);
+                const entity = spec(table);
                 for (const column of Object.keys(values)) {
                     if (!plainName.test(column)) throw new Error(`${column} is not a column name.`);
                     if (conventions.has(column) && column !== scopeColumn) {
                         throw new Error(`The store sets ${column} itself.`);
                     }
+                }
+                for (const [field, target] of entity.references) {
+                    const value = values[field];
+                    if (typeof value === "string") guardOthers(target, value, entry.change_id);
                 }
                 const syncId = newId();
                 const stamp = now();
@@ -690,8 +706,9 @@ function createEngine<T extends string>(
                 }
                 const current = row(table, syncId);
                 if (!current || current.deleted_at !== null) throw new MissingRowError(table, syncId);
-                // A provisional row may take the delta: neither reaches the server, and the
-                // delta goes with the row (releaseProvisional) or with its own change.
+                guardOthers(table, syncId, entry.change_id);
+                // A provisional row may take the delta: neither reaches the server. The delta
+                // goes with its own change, or is written again when the row goes first.
                 db.run(`UPDATE ${table} SET ${field} = ? WHERE sync_id = ?`, [
                     addValues(current[field], delta),
                     syncId,
@@ -743,10 +760,30 @@ function createEngine<T extends string>(
         if (found) throw new ProvisionalRowError(found.entity, scopeId);
     }
 
-    /** Removes provisional results: of one change, or of the changes the server applied in a scope. */
+    /**
+     * A result on a provisional row of another change is computed from that row, which goes
+     * when its change is answered. Only an app that can compute the result again builds it.
+     */
+    function guardOthers(entity: string, rowId: string, changeId: string) {
+        if (rederive || !hasProvisional()) return;
+        const owner = db.get<{ change_id: string }>(
+            "SELECT change_id FROM sync_provisional WHERE entity = ? AND row_id = ? AND field IS NULL",
+            [entity, rowId],
+        );
+        if (owner && owner.change_id !== changeId) throw new ProvisionalRowError(entity, rowId);
+    }
+
+    /**
+     * Removes provisional results: of one change, or of the changes the server applied in a
+     * scope. A result belongs to its own change only. A waiting change whose result was
+     * built on rows that now go is computed again on the rows that are left, as queued
+     * counters rebase on pulled rows: its old result goes first, then the answered changes'
+     * results, then `rederive` writes its result again, in outbox order.
+     */
     function settleProvisional(changeId: string): void;
     function settleProvisional(changeId: null, scopeId: string): void;
-    function settleProvisional(changeId: string | null, scopeId?: string) {
+    function settleProvisional(changeId: string, scopeId: undefined, again: boolean): void;
+    function settleProvisional(changeId: string | null, scopeId?: string, again = true) {
         if (!hasProvisional()) return;
         const effects =
             changeId !== null
@@ -757,16 +794,31 @@ function createEngine<T extends string>(
                       "SELECT * FROM sync_provisional WHERE scope_id IN (?, ?) AND acked = 1 ORDER BY id DESC",
                       [scopeId!, scopeAlias(scopeId!)],
                   );
-        // An applied change's row stays while a change still waiting has a result on it.
-        const kept = new Set<number>();
-        if (changeId === null) {
-            const settling = new Set(effects.map((effect) => effect.change_id));
-            for (const effect of effects) {
-                if (effect.field === null && carriesWaiting(effect, settling)) kept.add(effect.id);
-            }
+        if (effects.length === 0) return;
+        const waiting = again ? buildersOn(new Set(effects.map((effect) => effect.change_id))) : [];
+        for (const change of [...waiting].reverse()) {
+            removeEffects(
+                db.all<ProvisionalEffect>("SELECT * FROM sync_provisional WHERE change_id = ? ORDER BY id DESC", [
+                    change,
+                ]),
+            );
         }
+        removeEffects(effects);
+        for (const change of waiting) {
+            const entry = db.get<OutboxEntry>("SELECT * FROM sync_outbox WHERE change_id = ?", [change]);
+            // A change the server answered already gets its rows with the next pull.
+            if (!entry || !rederive) continue;
+            writeProvisional(entry, (local) =>
+                rederive(
+                    { entity: entry.entity, rowId: entry.row_id, op: entry.op, payload: JSON.parse(entry.payload) as Row },
+                    local,
+                ),
+            );
+        }
+    }
+
+    function removeEffects(effects: ProvisionalEffect[]) {
         for (const effect of effects) {
-            if (kept.has(effect.id)) continue;
             db.run("DELETE FROM sync_provisional WHERE id = ?", [effect.id]);
             const current = row(effect.entity, effect.row_id);
             if (!current) continue;
@@ -783,30 +835,50 @@ function createEngine<T extends string>(
     }
 
     /**
-     * Whether a change the server has not answered yet has a result on a provisional row
-     * of an applied change: a delta on it, or a provisional row that points at it or lives
-     * in it. A result belongs to its own change only, so the row stays, with its owner,
-     * until those changes are answered too: at worst it shows beside the server's row for
-     * a while. Moving the results onto the server's row would need its unit and the
-     * server's own amounts, which the device does not know.
+     * The other changes whose results build on the rows of these changes, also through
+     * each other's rows: a delta on such a row, or a provisional row that points at it or
+     * lives in it. In outbox order.
      */
-    function carriesWaiting(effect: ProvisionalEffect, settling: Set<string>): boolean {
-        const { entity, row_id: rowId } = effect;
-        if (!row(entity, rowId)) return false;
-        const waiting = (other: ProvisionalEffect) => !settling.has(other.change_id);
-        if (provisionalOn(entity, rowId).some(waiting)) return true;
-        return db
-            .all<ProvisionalEffect>("SELECT * FROM sync_provisional WHERE field IS NULL ORDER BY id")
-            .filter(waiting)
-            .some((other) => {
-                const source = specs.get(other.entity);
-                const child = row(other.entity, other.row_id);
-                if (!source || !child) return false;
-                if (source.scope(child, db) === rowId) return true;
-                return [...source.references].some(
-                    ([field, pointsAt]) => pointsAt === entity && child[field] === rowId,
-                );
-            });
+    function buildersOn(changes: Set<string>): string[] {
+        const going = new Set<string>();
+        const goingIds = new Set<string>();
+        const add = (change: string) => {
+            for (const made of db.all<{ entity: string; row_id: string }>(
+                "SELECT entity, row_id FROM sync_provisional WHERE change_id = ? AND field IS NULL",
+                [change],
+            )) {
+                going.add(`${made.entity}:${made.row_id}`);
+                goingIds.add(made.row_id);
+            }
+        };
+        for (const change of changes) add(change);
+        const found = new Set<string>();
+        for (let grew = true; grew; ) {
+            grew = false;
+            for (const effect of db.all<ProvisionalEffect>("SELECT * FROM sync_provisional ORDER BY id")) {
+                if (changes.has(effect.change_id) || found.has(effect.change_id)) continue;
+                if (!buildsOn(effect, going, goingIds)) continue;
+                found.add(effect.change_id);
+                add(effect.change_id);
+                grew = true;
+            }
+        }
+        const position = (change: string) =>
+            db.get<{ position: number }>("SELECT position FROM sync_outbox WHERE change_id = ?", [change])
+                ?.position ?? Number.MAX_SAFE_INTEGER;
+        return [...found].sort((a, b) => position(a) - position(b));
+    }
+
+    function buildsOn(effect: ProvisionalEffect, going: Set<string>, goingIds: Set<string>): boolean {
+        if (effect.field !== null) return going.has(`${effect.entity}:${effect.row_id}`);
+        const source = specs.get(effect.entity);
+        const child = row(effect.entity, effect.row_id);
+        if (!source || !child) return false;
+        const scopeId = source.scope(child, db);
+        if (scopeId !== null && goingIds.has(scopeId)) return true;
+        return [...source.references].some(
+            ([field, pointsAt]) => typeof child[field] === "string" && going.has(`${pointsAt}:${child[field]}`),
+        );
     }
 
     /**
@@ -819,7 +891,7 @@ function createEngine<T extends string>(
             "SELECT DISTINCT change_id FROM sync_provisional WHERE scope_id IN (?, ?)",
             [scopeId, scopeAlias(scopeId)],
         );
-        for (const { change_id } of changes) settleProvisional(change_id);
+        for (const { change_id } of changes) settleProvisional(change_id, undefined, false);
     }
 
     /** The scope a remapped scope became, so a client that still uses the old id settles its results. */

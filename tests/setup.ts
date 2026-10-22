@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { migrate, syncEngineSchemaV1, syncEngineSchemaV2 } from "../src/migrate.ts";
-import { createLocalStore } from "../src/store.ts";
+import { createLocalStore, type StoreOptions } from "../src/store.ts";
 import { applyPullPage } from "../src/sync.ts";
 import type { Row } from "../src/database.ts";
 import { memoryDatabase } from "./memory-database.ts";
@@ -55,11 +55,13 @@ export function setup({
     ids = [],
     onListenerError,
     db = memoryDatabase(),
+    rederive,
 }: {
     ids?: string[];
     onListenerError?: (error: unknown) => void;
     /** An existing database, to open a store again as after a restart. */
     db?: ReturnType<typeof memoryDatabase>;
+    rederive?: StoreOptions<Table>["rederive"];
 } = {}) {
     const fresh = db.get("SELECT 1 FROM sqlite_master WHERE name = 'scopes'") === null;
     if (fresh) migrate(db, testMigrations);
@@ -87,6 +89,7 @@ export function setup({
         newId: () => queue.shift() ?? `ID${String(++id).padStart(4, "0")}`,
         now: () => fixed ?? new Date(Date.UTC(2026, 9, 20, 9, 0, clock++)).toISOString(),
         onListenerError,
+        rederive,
     });
     if (fresh) {
         db.run(

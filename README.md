@@ -148,12 +148,30 @@ or a row in it as a scope throws a `ProvisionalRowError`;
 result may build on it, as the server's result builds on the server's own row:
 `add` puts a delta on it, and `insert` may point at it. Unchecking a purchase
 that made a new item, before the server's item arrives, takes its stock back
-this way. A result belongs to its own change only: it goes when that change
-settles or is refused, never when another change does. When the change that
-made the row settles while a later result on it still waits, the row stays,
-beside the server's own, until that result settles too. A refused change still
-takes its row along, with the results on it: the server never made that row. Whenever a row goes, by a
-remove, a pulled tombstone, an acked delete, a refused insert, a resync sweep or
+this way.
+
+A result built on another change's provisional row is computed from that row,
+which goes when its change is answered. So such a result belongs to its own
+change only, and the store writes it again whenever rows it was built on go:
+it takes the old result back, removes the answered change's results, then calls
+the app's `rederive` with the waiting change, in outbox order. The app writes
+what the change does on the rows there are now, as when the user made it. This
+also covers chains: a result built on a result that is written again is
+written again too. Without `rederive`, building on another change's
+provisional row throws a `ProvisionalRowError`.
+
+```ts
+createLocalStore(db, {
+    // ...
+    rederive: (change, local) => {
+        if (change.entity === "shopping_items" && "purchased" in change.payload) {
+            writePurchase(local, change.rowId, change.payload.purchased);
+        }
+    },
+});
+```
+
+Whenever a row goes, by a remove, a pulled tombstone, an acked delete, a refused insert, a resync sweep or
 a purge, the provisional rows that need it follow as through a foreign key: an
 optional link is cleared, a required link takes the provisional row along.
 This needs `syncEngineSchemaV2`, a later migration step than
