@@ -150,24 +150,25 @@ result may build on it, as the server's result builds on the server's own row:
 that made a new item, before the server's item arrives, takes its stock back
 this way.
 
-A result built on another change's provisional row is computed from that row,
-which goes when its change is answered. So such a result belongs to its own
-change only, and the store writes it again whenever rows it was built on go:
-it takes the old result back, removes the answered change's results, then calls
-the app's `rederive` with the waiting change, in outbox order. The app writes
-what the change does on the rows there are now, as when the user made it. This
-also covers chains: a result built on a result that is written again is
-written again too. Without `rederive`, building on another change's
-provisional row throws a `ProvisionalRowError`.
+A result is a prediction: what the change will do, computed on the server's
+rows and on the results of the changes before it in the outbox. When that
+ground moves (a drained pull, a refused change, a settled or dropped change),
+the store computes every waiting result again: it takes the old ones back, then
+calls the writer the app's `rederive` returns for each change, in outbox order,
+on the rows there are now. A result built on another change's provisional row
+is then written on the server's row once that one has arrived, in its unit and
+amounts, and never left on a row that is gone. `rederive` returns null for a
+change whose result the app does not compute; that change keeps its result.
+Without `rederive`, building on another change's provisional row throws a
+`ProvisionalRowError`.
 
 ```ts
 createLocalStore(db, {
     // ...
-    rederive: (change, local) => {
-        if (change.entity === "shopping_items" && "purchased" in change.payload) {
-            writePurchase(local, change.rowId, change.payload.purchased);
-        }
-    },
+    rederive: (change) =>
+        change.entity === "shopping_items" && "purchased" in change.payload
+            ? (local) => writePurchase(local, change.rowId, change.payload.purchased)
+            : null,
 });
 ```
 

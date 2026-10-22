@@ -22,13 +22,15 @@ export type StoreOptions<T extends string> = {
     /** Gets an error a listener threw after a commit. By default it is thrown again in a microtask. */
     onListenerError?: (error: unknown) => void;
     /**
-     * Writes a waiting change's provisional result again. The store calls it when rows the
-     * result was built on go, such as another change's provisional row once the server's
-     * own arrived, after it took the old result back. It writes what the change does on
-     * the rows there are now, as when the user made it. An app needs it to build a result
-     * on another change's provisional row.
+     * Computes a waiting change's provisional result again. Return the writer for a change
+     * whose result the app computes (an action), or null for any other. Results are a
+     * prediction on top of the server's rows, in outbox order, so the store computes them
+     * all again when that ground moves: after a pull, a refusal or a settled change. It
+     * takes the old results back first, then calls each writer in outbox order on the
+     * rows there are now. An app needs it to build a result on another change's
+     * provisional row.
      */
-    rederive?: (change: QueuedChange, local: ProvisionalWriter) => void;
+    rederive?: (change: QueuedChange) => ((local: ProvisionalWriter) => void) | null;
 };
 
 /** A change waiting in the outbox, as `rederive` gets it. */
@@ -775,10 +777,9 @@ function createEngine<T extends string>(
 
     /**
      * Removes provisional results: of one change, or of the changes the server applied in a
-     * scope. A result belongs to its own change only. A waiting change whose result was
-     * built on rows that now go is computed again on the rows that are left, as queued
-     * counters rebase on pulled rows: its old result goes first, then the answered changes'
-     * results, then `rederive` writes its result again, in outbox order.
+     * scope. With `rederive`, the waiting changes' results are computed again on what is
+     * left (rederiveWaiting); `again` false leaves them, for a purge or a refusal that
+     * restores its row first.
      */
     function settleProvisional(changeId: string): void;
     function settleProvisional(changeId: null, scopeId: string): void;
@@ -794,26 +795,46 @@ function createEngine<T extends string>(
                       "SELECT * FROM sync_provisional WHERE scope_id IN (?, ?) AND acked = 1 ORDER BY id DESC",
                       [scopeId!, scopeAlias(scopeId!)],
                   );
-        if (effects.length === 0) return;
-        const waiting = again ? buildersOn(new Set(effects.map((effect) => effect.change_id))) : [];
-        for (const change of [...waiting].reverse()) {
+        const scope = scopeId ?? effects[0]?.scope_id;
+        if (!again || !rederive || scope === undefined) {
+            removeEffects(effects);
+            return;
+        }
+        rederiveWaiting(scope, () => removeEffects(effects), changeId);
+    }
+
+    /**
+     * Computes the results of the scope's waiting changes again: takes them back, lets
+     * `between` change the ground, then writes each one again in outbox order. Only the
+     * changes `rederive` computes; another change keeps its result.
+     */
+    function rederiveWaiting(scopeId: string, between: () => void = () => {}, except: string | null = null) {
+        const writers: { entry: OutboxEntry; write: (local: ProvisionalWriter) => void }[] = [];
+        for (const entry of db.all<OutboxEntry>(
+            "SELECT * FROM sync_outbox WHERE scope_id IN (?, ?) ORDER BY position",
+            [scopeId, scopeAlias(scopeId)],
+        )) {
+            if (entry.change_id === except) continue;
+            const write = rederive?.({
+                entity: entry.entity,
+                rowId: entry.row_id,
+                op: entry.op,
+                payload: JSON.parse(entry.payload) as Row,
+            });
+            if (write) writers.push({ entry, write });
+        }
+        for (const { entry } of [...writers].reverse()) {
             removeEffects(
                 db.all<ProvisionalEffect>("SELECT * FROM sync_provisional WHERE change_id = ? ORDER BY id DESC", [
-                    change,
+                    entry.change_id,
                 ]),
             );
         }
-        removeEffects(effects);
-        for (const change of waiting) {
-            const entry = db.get<OutboxEntry>("SELECT * FROM sync_outbox WHERE change_id = ?", [change]);
-            // A change the server answered already gets its rows with the next pull.
-            if (!entry || !rederive) continue;
-            writeProvisional(entry, (local) =>
-                rederive(
-                    { entity: entry.entity, rowId: entry.row_id, op: entry.op, payload: JSON.parse(entry.payload) as Row },
-                    local,
-                ),
-            );
+        between();
+        for (const { entry, write } of writers) {
+            // An earlier writer, or `between`, may have cancelled the change.
+            const current = db.get<OutboxEntry>("SELECT * FROM sync_outbox WHERE change_id = ?", [entry.change_id]);
+            if (current) writeProvisional(current, write);
         }
     }
 
@@ -832,53 +853,6 @@ function createEngine<T extends string>(
             ]);
             touch(effect.entity);
         }
-    }
-
-    /**
-     * The other changes whose results build on the rows of these changes, also through
-     * each other's rows: a delta on such a row, or a provisional row that points at it or
-     * lives in it. In outbox order.
-     */
-    function buildersOn(changes: Set<string>): string[] {
-        const going = new Set<string>();
-        const goingIds = new Set<string>();
-        const add = (change: string) => {
-            for (const made of db.all<{ entity: string; row_id: string }>(
-                "SELECT entity, row_id FROM sync_provisional WHERE change_id = ? AND field IS NULL",
-                [change],
-            )) {
-                going.add(`${made.entity}:${made.row_id}`);
-                goingIds.add(made.row_id);
-            }
-        };
-        for (const change of changes) add(change);
-        const found = new Set<string>();
-        for (let grew = true; grew; ) {
-            grew = false;
-            for (const effect of db.all<ProvisionalEffect>("SELECT * FROM sync_provisional ORDER BY id")) {
-                if (changes.has(effect.change_id) || found.has(effect.change_id)) continue;
-                if (!buildsOn(effect, going, goingIds)) continue;
-                found.add(effect.change_id);
-                add(effect.change_id);
-                grew = true;
-            }
-        }
-        const position = (change: string) =>
-            db.get<{ position: number }>("SELECT position FROM sync_outbox WHERE change_id = ?", [change])
-                ?.position ?? Number.MAX_SAFE_INTEGER;
-        return [...found].sort((a, b) => position(a) - position(b));
-    }
-
-    function buildsOn(effect: ProvisionalEffect, going: Set<string>, goingIds: Set<string>): boolean {
-        if (effect.field !== null) return going.has(`${effect.entity}:${effect.row_id}`);
-        const source = specs.get(effect.entity);
-        const child = row(effect.entity, effect.row_id);
-        if (!source || !child) return false;
-        const scopeId = source.scope(child, db);
-        if (scopeId !== null && goingIds.has(scopeId)) return true;
-        return [...source.references].some(
-            ([field, pointsAt]) => typeof child[field] === "string" && going.has(`${pointsAt}:${child[field]}`),
-        );
     }
 
     /**
@@ -1339,6 +1313,7 @@ function createEngine<T extends string>(
         guardReferences,
         guardScope,
         settleProvisional,
+        rederiveWaiting,
         discardProvisional,
         ackProvisional,
         carriesProvisional,

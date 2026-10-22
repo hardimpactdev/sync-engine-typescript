@@ -132,6 +132,8 @@ export function applyAcks(store: LocalStore, scopeId: string, acks: Ack[]): AckR
             }
             result.applied.push(ack.change_id);
         }
+        // A refusal moved the ground the waiting changes' results were computed on.
+        if (result.rejected.length > 0) engine.rederiveWaiting(scopeId);
         markState(engine, scopeId, "last_push_at");
         engine.touch("sync_outbox");
     });
@@ -192,8 +194,9 @@ function keep(
         ],
     );
     engine.db.run("DELETE FROM sync_outbox WHERE position = ?", [entry.position]);
-    // The server will not run this change, so its provisional result goes.
-    engine.settleProvisional(entry.change_id);
+    // The server will not run this change, so its provisional result goes. The waiting
+    // changes' results are computed again once the row is restored (applyAcks).
+    engine.settleProvisional(entry.change_id, undefined, false);
     engine.touch("sync_rejected");
     return {
         change_id: entry.change_id,

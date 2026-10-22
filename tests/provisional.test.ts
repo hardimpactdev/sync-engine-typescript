@@ -475,9 +475,10 @@ function useButter(local: ProvisionalWriter, delta: string) {
 
 /** The app's `rederive`: the tally update uses 2 butter, the hall rename 1. */
 const usesButter: Parameters<typeof setup>[0] = {
-    rederive: (change, local) => {
-        if (change.entity === "counters") useButter(local, "-2.000");
-        if (change.entity === "rooms") useButter(local, "-1.000");
+    rederive: (change) => {
+        if (change.entity === "counters") return (local) => useButter(local, "-2.000");
+        if (change.entity === "rooms") return (local) => useButter(local, "-1.000");
+        return null;
     },
 };
 
@@ -630,9 +631,7 @@ test("results that build on each other in a chain are written again together", (
         if (jar) local.insert("parts", { scope_id: jar.scope_id, item_id: jar.sync_id, name: "Lid" });
     };
     const options: Parameters<typeof setup>[0] = {
-        rederive: (change, local) => {
-            if (change.entity === "rooms") addLid(local);
-        },
+        rederive: (change) => (change.entity === "rooms" ? addLid : null),
     };
     const { store, db } = kitchen(options);
     pulled(store, "counters", tally, { name: "Bakes", quantity: 0 }, 3);
@@ -679,9 +678,42 @@ test("results that build on each other in a chain are written again together", (
     );
 });
 
+// A result can depend on another change's result by reading it, not only by pointing at
+// it: here the tally takes all butter that is left after the hall's use.
+test("a refusal computes again a waiting result that read the refused result", () => {
+    const takeTheRest = (local: ProvisionalWriter) => {
+        const left = local.get<{ quantity: string }>("SELECT quantity FROM stock WHERE sync_id = ?", [serverButter])!;
+        local.add("stock", serverButter, "quantity", (-Number(left.quantity)).toFixed(3));
+    };
+    const { store } = kitchen({
+        rederive: (change) => {
+            if (change.entity === "rooms") return (local) => local.add("stock", serverButter, "quantity", "-1.000");
+            if (change.entity === "counters") return takeTheRest;
+            return null;
+        },
+    });
+    pulled(store, "stock", serverButter, { name: "Butter", quantity: "5.000" }, 3);
+    pulled(store, "rooms", hall, { name: "Hall" }, 3);
+    pulled(store, "counters", tally, { name: "Bakes", quantity: 0 }, 3);
+    store.update("rooms", hall, { name: "Front hall" }, { provisional: (local) => local.add("stock", serverButter, "quantity", "-1.000") });
+    store.update("counters", tally, { name: "Bakes today" }, { provisional: takeTheRest });
+    assert.deepEqual(stockRows(store), [{ sync_id: serverButter, quantity: "0.000" }]);
+
+    const [rename] = takeBatch(store, scope);
+    applyAcks(store, scope, [
+        { change_id: rename.change_id, status: "rejected", error: { code: "validation", message: "No." }, current: { name: "Hall" } },
+    ]);
+
+    // The tally takes all 5 now, not the 4 it saw before.
+    assert.deepEqual(stockRows(store), [{ sync_id: serverButter, quantity: "0.000" }]);
+    assert.equal(outbox(store).length, 1);
+});
+
 test("provisional rows that point at a refused change's rows are written again", () => {
     let writes = 0;
-    const { store } = kitchen({ rederive: () => void writes++ });
+    const { store } = kitchen({
+        rederive: (change) => (change.entity === "counters" ? () => void writes++ : null),
+    });
     let room = "";
     let jar = "";
     let lid = "";
