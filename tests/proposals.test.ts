@@ -199,27 +199,44 @@ test("removing a proposed row before its change is answered deletes it after the
     );
 });
 
-test("a key used again in a merged change moves to the newer row", () => {
+test("an action that proposes rows stays whole: a later write never merges into it", () => {
     const { store } = kitchen();
-    const first = bake(store, "Baked");
-    const second = bake(store, "Baked twice");
+    const room = bake(store);
+    // Undoing the bake would merge into it, and the server would make no room; the rename
+    // that needs the room would go too. So each goes as its own change.
+    store.update("items", cake, { notes: null });
+    store.update("rooms", room, { name: "Larder" });
+
+    assert.deepEqual(
+        outbox(store).map((entry) => [entry.entity, entry.payload]),
+        [
+            ["items", { notes: "Baked" }],
+            ["items", { notes: null }],
+            ["rooms", { name: "Larder" }],
+        ],
+    );
+});
+
+test("a key used again within one change moves to the newer row", () => {
+    const { store } = kitchen();
+    let first = "";
+    let second = "";
+    store.update(
+        "items",
+        cake,
+        { notes: "Baked" },
+        {
+            provisional: (local) => {
+                first = local.insert("rooms", { scope_id: scope, name: "Pantry" }, { key: "room" });
+                second = local.insert("rooms", { scope_id: scope, name: "Shelf" }, { key: "room" });
+            },
+        },
+    );
 
     const [change] = takeBatch(store, scope);
     assert.deepEqual(change.proposals, { room: second });
     assert.equal(store.isProposed("rooms", second), true);
     assert.equal(store.isProposed("rooms", first), false);
-
-    // The server made one room, under the newer id. The older room was a prediction only.
-    applyAcks(store, scope, [{ change_id: change.change_id, status: "applied", seq: 5, made: { room: second } }]);
-    applyPullPage(store, scope, {
-        changes: [{ entity: "rooms", id: second, seq: 6, op: "upsert", row: { name: "Pantry" } }],
-        cursor: "c6",
-        has_more: false,
-    });
-    assert.deepEqual(
-        store.all<{ sync_id: string }>("SELECT sync_id FROM rooms").map((row) => row.sync_id),
-        [second],
-    );
 });
 
 test("a duplicate ack repeats made", () => {

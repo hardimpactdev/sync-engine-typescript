@@ -538,6 +538,8 @@ function createEngine<T extends string>(
             last !== undefined &&
             unsent(last) &&
             !last.merge &&
+            // An action that proposes rows stays whole: later changes may need what it makes.
+            !last.proposals &&
             // Never across a later delete or operation: the server must see this change after it.
             !entries.some((entry) => entry.position > last.position && entry.op !== "upsert") &&
             !referencesQueuedAfter(entity, fields, last.position);
